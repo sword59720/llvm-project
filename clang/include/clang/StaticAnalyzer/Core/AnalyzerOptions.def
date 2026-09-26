@@ -405,6 +405,14 @@ ANALYZER_OPTION(
     true)
 
 ANALYZER_OPTION(
+    bool, ShouldRecoverErrors, "checker-error-recover",
+    "Experimental: generate non-fatal error nodes for all checkers using "
+    "CheckerContext::generateErrorNode. Attempt to continue after errors; "
+    "checker-specific recovery and engine limitations still apply. "
+    "Explicit sinks and exploration limits are preserved.",
+    true)
+
+ANALYZER_OPTION(
     bool, ShouldSuppressAddressSpaceDereferences, "suppress-dereferences-from-any-address-space",
     "The analyzer does not report dereferences on memory that use "
     "address space #256, #257, and #258. Those address spaces are used when "

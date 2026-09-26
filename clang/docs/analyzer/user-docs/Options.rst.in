@@ -93,6 +93,32 @@ separate arguments (and this is why the example needs to use ``--`` before
 to ensure that they are passed to the clang static analyzer (and not other
 analyzer tools that are also supported by CodeChecker).
 
+Continuing after checker errors
+==============================
+
+The experimental ``checker-error-recover=true`` option controls error recovery
+across checkers through the common ``CheckerContext::generateErrorNode`` API. Both
+overloads create non-sink error nodes by default for all checkers that use this
+API. No per-checker opt-in is required. For example::
+
+  clang --analyze -Xclang -analyzer-config -Xclang checker-error-recover=true foo.cpp
+
+Checker-specific recovery uses the same option. For example, after a reported
+definite null pointer access, an invalid load produces an unknown value and an
+invalid store is skipped without changing memory. Subsequent path diagnostics
+include a note explaining this null access recovery. Paths continued after
+undefined behavior model an artificial continuation, not a defined execution
+of the original program.
+
+This option is enabled by default. Set ``checker-error-recover=false`` to
+restore error nodes that terminate the path. It changes the shared error-node
+policy, but does not guarantee recovery from every error: checkers and the engine may
+still be unable to model subsequent execution (for example, a store through an
+uninitialized pointer). Explicit ``generateSink`` and ``addSink`` calls retain
+their semantics, including termination for non-returning calls and infeasible
+paths. Exploration limits also remain in effect. Reporting an error should use
+``generateErrorNode`` rather than a direct sink when recovery is intended.
+
 .. _list-of-analyzer-options:
 
 List of analyzer options

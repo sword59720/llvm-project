@@ -53,6 +53,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/LoopUnrolling.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/LoopWidening.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/NullDereferenceRecovery.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState_Fwd.h"
@@ -3781,8 +3782,18 @@ void ExprEngine::evalStore(ExplodedNodeSet &Dst, const Expr *AssignE,
   if (location.isUndef())
     return;
 
-  for (const auto I : Tmp)
+  for (const auto I : Tmp) {
+    if (I->getState()->get<PendingNullDereferenceRecovery>()) {
+      // A reported null store has no valid destination. Preserve the rest of
+      // the state and continue without binding the value to memory.
+      ProgramStateRef RecoveredState =
+          I->getState()->remove<PendingNullDereferenceRecovery>();
+      PostStore PS(StoreE, I->getStackFrame(), location.getAsRegion(), tag);
+      Dst.insert(Engine.makeNode(PS, RecoveredState, I));
+      continue;
+    }
     evalBind(Dst, StoreE, I, location, Val, false);
+  }
 }
 
 void ExprEngine::evalLoad(ExplodedNodeSet &Dst,
@@ -3812,7 +3823,11 @@ void ExprEngine::evalLoad(ExplodedNodeSet &Dst,
     state = I->getState();
 
     SVal V = UnknownVal();
-    if (location.isValid()) {
+    if (state->get<PendingNullDereferenceRecovery>()) {
+      // Do not read from the invalid location or propagate UndefinedVal into
+      // subsequent expressions: the recovered load has an unknown result.
+      state = state->remove<PendingNullDereferenceRecovery>();
+    } else if (location.isValid()) {
       if (LoadTy.isNull())
         LoadTy = BoundEx->getType();
       V = state->getSVal(location.castAs<Loc>(), LoadTy);

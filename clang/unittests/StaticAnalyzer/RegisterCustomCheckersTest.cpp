@@ -54,6 +54,70 @@ TEST(RegisterCustomCheckers, RegisterChecker) {
   EXPECT_EQ(Diags, "test.CustomChecker: Custom diagnostic description\n");
 }
 
+template <bool ExplicitPredecessor>
+class ErrorRecoveryChecker : public Checker<check::PreStmt<DeclStmt>> {
+  const BugType BT{this, "Error recovery"};
+
+public:
+  void checkPreStmt(const DeclStmt *DS, CheckerContext &C) const {
+    ExplodedNode *Pred = C.getPredecessor();
+    ExplodedNode *N;
+    if constexpr (ExplicitPredecessor) {
+      static SimpleProgramPointTag PredTag("ErrorRecovery", "predecessor");
+      static SimpleProgramPointTag ErrorTag("ErrorRecovery", "error");
+      Pred = C.addTransition(C.getState(), &PredTag);
+      ASSERT_NE(Pred, nullptr);
+      N = C.generateErrorNode(C.getState(), Pred, &ErrorTag);
+    } else {
+      N = C.generateErrorNode();
+    }
+    ASSERT_NE(N, nullptr);
+    EXPECT_EQ(N->isSink(), !C.shouldRecoverErrors());
+    EXPECT_EQ(N->getFirstPred(), Pred);
+    C.emitReport(std::make_unique<PathSensitiveBugReport>(
+        BT, cast<VarDecl>(DS->getSingleDecl())->getName(), N));
+  }
+};
+
+template <bool ExplicitPredecessor>
+void addErrorRecoveryChecker(AnalysisASTConsumer &Consumer,
+                             AnalyzerOptions &Opts) {
+  Opts.CheckersAndPackages = {{"test.ErrorRecovery", true}};
+  Consumer.AddCheckerRegistrationFn([](CheckerRegistry &Registry) {
+    Registry.addChecker<ErrorRecoveryChecker<ExplicitPredecessor>>(
+        "test.ErrorRecovery", "Test the common error-node recovery policy");
+  });
+}
+
+template <bool ExplicitPredecessor> void testErrorRecoveryPolicy() {
+  const char *Code = "void f() { int a; int b; }";
+  // No configuration is needed, including for externally registered checkers.
+  std::string DefaultDiags;
+  EXPECT_TRUE(runCheckerOnCode<addErrorRecoveryChecker<ExplicitPredecessor>>(
+      Code, DefaultDiags, /*OnlyEmitWarnings=*/true));
+  EXPECT_EQ(DefaultDiags, "test.ErrorRecovery: a\ntest.ErrorRecovery: b\n");
+  for (bool Recover : {false, true}) {
+    std::string Diags;
+    EXPECT_TRUE(
+        runCheckerOnCodeWithArgs<addErrorRecoveryChecker<ExplicitPredecessor>>(
+            Code,
+            {"-Xclang", "-analyzer-config", "-Xclang",
+             Recover ? "checker-error-recover=true"
+                     : "checker-error-recover=false"},
+            Diags, /*OnlyEmitWarnings=*/true));
+    EXPECT_EQ(Diags, Recover ? "test.ErrorRecovery: a\ntest.ErrorRecovery: b\n"
+                             : "test.ErrorRecovery: a\n");
+  }
+}
+
+TEST(RegisterCustomCheckers, ErrorRecoveryImplicitPredecessor) {
+  testErrorRecoveryPolicy<false>();
+}
+
+TEST(RegisterCustomCheckers, ErrorRecoveryExplicitPredecessor) {
+  testErrorRecoveryPolicy<true>();
+}
+
 //===----------------------------------------------------------------------===//
 // Pretty much the same.
 //===----------------------------------------------------------------------===//

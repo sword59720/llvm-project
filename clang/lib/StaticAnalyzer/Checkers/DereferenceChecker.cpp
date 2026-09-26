@@ -19,6 +19,7 @@
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerHelpers.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/NullDereferenceRecovery.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -43,7 +44,8 @@ class DereferenceChecker
                            check::PreStmt<BinaryOperator>,
                            EventDispatcher<ImplicitNullDerefEvent>> {
   void reportDerefBug(const DerefBugType &BT, ProgramStateRef State,
-                      const Stmt *S, CheckerContext &C) const;
+                      const Stmt *S, CheckerContext &C,
+                      bool IsRecoverableNullAccess = false) const;
 
   bool suppressReport(CheckerContext &C, const Expr *E) const;
 
@@ -188,7 +190,8 @@ static bool isDeclRefExprToReference(const Expr *E) {
 
 void DereferenceChecker::reportDerefBug(const DerefBugType &BT,
                                         ProgramStateRef State, const Stmt *S,
-                                        CheckerContext &C) const {
+                                        CheckerContext &C,
+                                        bool IsRecoverableNullAccess) const {
   if (&BT == &FixedAddressBug) {
     if (!FixedDerefChecker.isEnabled())
       // Deliberately don't add a sink node if check is disabled.
@@ -201,7 +204,7 @@ void DereferenceChecker::reportDerefBug(const DerefBugType &BT,
     }
   }
 
-  // Generate an error node.
+  const bool Recover = IsRecoverableNullAccess && C.shouldRecoverErrors();
   ExplodedNode *N = C.generateErrorNode(State);
   if (!N)
     return;
@@ -266,6 +269,12 @@ void DereferenceChecker::reportDerefBug(const DerefBugType &BT,
     BR->addRange(R);
 
   C.emitReport(std::move(BR));
+
+  if (Recover)
+    C.addTransition(
+        State->set<PendingNullDereferenceRecovery>(true), N,
+        C.getNoteTag("Analysis continued after this null pointer dereference "
+                     "using an unknown value for a load or skipping a store"));
 }
 
 void DereferenceChecker::checkLocation(SVal l, bool isLoad, const Stmt* S,
@@ -295,7 +304,8 @@ void DereferenceChecker::checkLocation(SVal l, bool isLoad, const Stmt* S,
       // we call an "explicit" null dereference.
       const Expr *expr = getDereferenceExpr(S);
       if (!suppressReport(C, expr)) {
-        reportDerefBug(NullBug, nullState, expr, C);
+        reportDerefBug(NullBug, nullState, expr, C,
+                       /*IsRecoverableNullAccess=*/true);
         return;
       }
     }

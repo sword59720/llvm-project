@@ -223,22 +223,27 @@ public:
     generateSink(State, getPredecessor());
   }
 
-  /// Generate a transition to a node that will be used to report
-  /// an error. This node will be a sink. That is, it will stop exploration of
-  /// the given path.
+  /// Whether checker errors should allow further path exploration. Checkers
+  /// may also need to repair their state or request engine recovery.
+  bool shouldRecoverErrors() const {
+    return Eng.getAnalysisManager().getAnalyzerOptions().ShouldRecoverErrors;
+  }
+
+  /// Generate a transition to a node that will be used to report an error.
+  /// With checker-error-recover=true (the default), this is a non-sink,
+  /// allowing exploration subject to checker and engine modeling limitations.
+  /// Setting checker-error-recover=false makes it a sink.
   ///
   /// @param State The state of the generated node.
   /// @param Tag The tag to uniquely identify the creation site. If null,
   ///        the default tag for the checker will be used.
   ExplodedNode *generateErrorNode(ProgramStateRef State = nullptr,
                                   const ProgramPointTag *Tag = nullptr) {
-    return generateSink(State, Pred,
-                       (Tag ? Tag : Location.getTag()));
+    return generateErrorNode(State, Pred, Tag);
   }
 
-  /// Generate a transition to a node that will be used to report
-  /// an error. This node will be a sink. That is, it will stop exploration of
-  /// the given path.
+  /// Generate an error node with an explicit predecessor. Like the overload
+  /// above, this respects the global checker-error-recover option.
   ///
   /// @param State The state of the generated node.
   /// @param Pred The transition will be generated from the specified Pred node
@@ -248,8 +253,8 @@ public:
   ExplodedNode *generateErrorNode(ProgramStateRef State,
                                   ExplodedNode *Pred,
                                   const ProgramPointTag *Tag = nullptr) {
-    return generateSink(State, Pred,
-                       (Tag ? Tag : Location.getTag()));
+    return addTransitionImpl(State ? State : getState(), !shouldRecoverErrors(),
+                             Pred, Tag ? Tag : Location.getTag());
   }
 
   /// Generate a transition to a node that will be used to report
