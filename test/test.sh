@@ -36,3 +36,15 @@ echo "=== 4. error-recovery.cpp 全文件文本报告 (恢复关闭, 对比) ===
   -analyzer-checker=core,unix.Malloc,debug.ExprInspection \
   -analyzer-config checker-error-recover=false \
   -analyzer-output=text "$TEST_DIR/error-recovery.cpp"
+
+echo
+echo "=== 5. 生成 plist 报告到 Output 目录 ==="
+# Output/ 是 lit 的临时目录(%t/%T 展开于此), lit 发现测试时会跳过, 适合存放生成产物
+mkdir -p "$TEST_DIR/Output"
+for f in error-recovery null-dereference-recovery; do
+  "$CLANG" -cc1 -analyze -setup-static-analyzer -std=c++11 \
+    -analyzer-checker=core,unix.Malloc,debug.ExprInspection \
+    -analyzer-config checker-error-recover=true \
+    -analyzer-output=plist -o "$TEST_DIR/Output/$f.plist" "$TEST_DIR/$f.cpp"
+  echo "已写入 $TEST_DIR/Output/$f.plist"
+done
