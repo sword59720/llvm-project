@@ -2,17 +2,13 @@ import os
 
 import lit.formats
 
-# Standalone lit config for custom analyzer tests kept outside clang/test so
-# they stay separate from the upstream tree. Run with:
-#   build-ninja/bin/llvm-lit test/Analysis
+# Standalone lit config for the checker-error-recover feature tests, kept
+# outside clang/test so they stay separate from the upstream tree. Run with:
+#   build-ninja/bin/llvm-lit test/checker_recovery_test
 
-config.name = "custom-analysis"
+config.name = "checker-recovery"
 config.test_format = lit.formats.ShTest()
 config.suffixes = [".cpp", ".c"]
-
-# nullptr_test.cpp is a manual playground file run directly against clang
-# (no RUN lines); also exclude its analyzer output artifacts.
-config.excludes.add("nullptr_test.cpp")
 
 here = os.path.dirname(os.path.abspath(__file__))
 repo_root = os.path.dirname(os.path.dirname(here))
