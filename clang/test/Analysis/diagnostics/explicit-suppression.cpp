@@ -1,6 +1,11 @@
-// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config suppress-c++-stdlib=false -verify %s
-// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config suppress-c++-stdlib=true -DSUPPRESSED=1 -verify %s
-// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -DSUPPRESSED=1 -verify %s
+// codeXek fork: checker-error-recover defaults to true in this fork; the
+// unexpected cascade diagnostics after a recovered error are asserted in
+// test/checker_recovery_test/, while these upstream expectations pin the
+// upstream sink semantics, so the analysis invocations pin the upstream
+// default explicitly.
+// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config suppress-c++-stdlib=false,checker-error-recover=false -verify %s
+// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config suppress-c++-stdlib=true,checker-error-recover=false -DSUPPRESSED=1 -verify %s
+// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config checker-error-recover=false -DSUPPRESSED=1 -verify %s
 
 #ifdef SUPPRESSED
 // expected-no-diagnostics

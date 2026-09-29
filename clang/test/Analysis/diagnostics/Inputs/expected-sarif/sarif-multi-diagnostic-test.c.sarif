@@ -90,7 +90,8 @@
             "text": "tainted"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "5c964815b8d6db3989bacdd308e657d0"
+            "clang/issueHash/v1": "5c964815b8d6db3989bacdd308e657d0",
+            "codexek/issueHash/v2": "644f3153331ee7b381fb3d669d11dd75"
           },
           "ruleId": "debug.TaintTest",
           "ruleIndex": 0
@@ -188,7 +189,8 @@
             "text": "Called function pointer is an uninitialized pointer value"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "256f6502719de88bece09a676d4102c6"
+            "clang/issueHash/v1": "256f6502719de88bece09a676d4102c6",
+            "codexek/issueHash/v2": "345fc8ecdd29cd810015e0989bd99958"
           },
           "ruleId": "core.CallAndMessage",
           "ruleIndex": 1
@@ -283,7 +285,8 @@
             "text": "Division by zero"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "91023b85b7e0ff79f11ab603e63cfa58"
+            "clang/issueHash/v1": "91023b85b7e0ff79f11ab603e63cfa58",
+            "codexek/issueHash/v2": "b0c02ff4c7e596c4f5fa8e95dd6245ea"
           },
           "ruleId": "core.DivideZero",
           "ruleIndex": 2
@@ -398,7 +401,8 @@
             "text": "Potential leak of memory pointed to by 'mem'"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "b18daabce2816b9efb6afffaa64ca9f9"
+            "clang/issueHash/v1": "b18daabce2816b9efb6afffaa64ca9f9",
+            "codexek/issueHash/v2": "6b06d022705533d1d23d9054ab049862"
           },
           "ruleId": "unix.Malloc",
           "ruleIndex": 3
@@ -474,7 +478,8 @@
             "text": "Division by zero"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "4e53611783411e0dae06a4084b00281c"
+            "clang/issueHash/v1": "4e53611783411e0dae06a4084b00281c",
+            "codexek/issueHash/v2": "2d573ee971d6ed6dc197b860083026f8"
           },
           "ruleId": "core.DivideZero",
           "ruleIndex": 2

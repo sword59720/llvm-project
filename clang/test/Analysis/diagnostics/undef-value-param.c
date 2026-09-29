@@ -1,5 +1,5 @@
-// RUN: %clang_analyze_cc1 -analyzer-checker=core -analyzer-output=text -verify %s
-// RUN: %clang_analyze_cc1 -analyzer-checker=core -analyzer-output=plist-multi-file  %s -o %t.plist
+// RUN: %clang_analyze_cc1 -analyzer-checker=core -analyzer-config checker-error-recover=false -analyzer-output=text -verify %s
+// RUN: %clang_analyze_cc1 -analyzer-checker=core -analyzer-config checker-error-recover=false -analyzer-output=plist-multi-file  %s -o %t.plist
 // RUN: %normalize_plist <%t.plist | diff -ub %S/Inputs/expected-plists/undef-value-param.c.plist -
 
 void foo_irrelevant(int c) {

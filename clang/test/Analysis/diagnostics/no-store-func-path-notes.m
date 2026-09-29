@@ -1,4 +1,9 @@
-// RUN: %clang_analyze_cc1 -x objective-c -analyzer-checker=core,nullability -analyzer-output=text -Wno-objc-root-class -fblocks -verify %s
+// codeXek fork: checker-error-recover defaults to true in this fork; the
+// unexpected cascade diagnostics after a recovered error are asserted in
+// test/checker_recovery_test/, while these upstream expectations pin the
+// upstream sink semantics, so the analysis invocations pin the upstream
+// default explicitly.
+// RUN: %clang_analyze_cc1 -x objective-c -analyzer-checker=core,nullability -analyzer-config checker-error-recover=false -analyzer-output=text -Wno-objc-root-class -fblocks -verify %s
 
 #include "../Inputs/system-header-simulator-for-nullability.h"
 

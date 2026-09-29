@@ -1,4 +1,9 @@
-// RUN: %clang_analyze_cc1 -w -analyzer-checker=core -analyzer-output=text \
+// codeXek fork: checker-error-recover defaults to true in this fork; the
+// unexpected cascade diagnostics after a recovered error are asserted in
+// test/checker_recovery_test/, while these upstream expectations pin the
+// upstream sink semantics, so the analysis invocations pin the upstream
+// default explicitly.
+// RUN: %clang_analyze_cc1 -w -analyzer-checker=core -analyzer-config checker-error-recover=false -analyzer-output=text \
 // RUN:   -verify %s
 
 namespace note_on_skipped_vbases {
