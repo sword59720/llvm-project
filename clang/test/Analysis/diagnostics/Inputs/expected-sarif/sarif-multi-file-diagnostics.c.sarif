@@ -108,7 +108,8 @@
             "text": "Dereference of null pointer (loaded from variable 'p')"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "d0323824ffaf9fee78b866e18d300fda"
+            "clang/issueHash/v1": "d0323824ffaf9fee78b866e18d300fda",
+            "codexek/issueHash/v2": "56a16a5e4209435a215b9163ec9238db"
           },
           "ruleId": "core.NullDereference",
           "ruleIndex": 0

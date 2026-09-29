@@ -152,6 +152,72 @@ static llvm::SmallString<32> GetMD5HashOfContent(StringRef Content) {
   return Res;
 }
 
+// Tokenizes the issue line with the exact same walk NormalizeLine performs
+// and additionally determines, within that single walk, the byte offset of
+// the issue's starting token inside the concatenation of the line's tokens.
+// The V2 hash must take the relative column and the line content from one
+// shared tokenization: two independent computations could reintroduce
+// sensitivity to whitespace alignment.
+//
+// Keep this walk in lockstep with NormalizeLine: same start (first
+// non-whitespace character of the issue's expansion line) and same stopping
+// rule (first token that starts a new line).
+static std::pair<std::string, size_t>
+GetNormalizedLineAndIssueColumnOffset(const SourceManager &SM,
+                                      const FullSourceLoc &L,
+                                      const LangOptions &LangOpts) {
+  static StringRef Whitespaces = " \t\n";
+
+  StringRef Str = GetNthLineOfFile(SM.getBufferOrNone(L.getFileID(), L),
+                                   L.getExpansionLineNumber());
+  StringRef::size_type col = Str.find_first_not_of(Whitespaces);
+  if (col == StringRef::npos)
+    col = 1; // The line only contains whitespace.
+  else
+    col++;
+  SourceLocation StartOfLine =
+      SM.translateLineCol(SM.getFileID(L), L.getExpansionLineNumber(), col);
+  std::optional<llvm::MemoryBufferRef> Buffer =
+      SM.getBufferOrNone(SM.getFileID(StartOfLine), StartOfLine);
+  if (!Buffer)
+    return {};
+
+  const char *BufferPos = SM.getCharacterData(StartOfLine);
+  // The issue position shares the line's buffer, so raw pointer comparison
+  // against token extents is valid. Same FileID as the line by construction.
+  const char *IssuePos = SM.getCharacterData(L);
+
+  Token Token;
+  Lexer Lexer(SM.getLocForStartOfFile(SM.getFileID(StartOfLine)), LangOpts,
+              Buffer->getBufferStart(), BufferPos, Buffer->getBufferEnd());
+
+  size_t NextStart = 0;
+  size_t ColumnOffset = 0;
+  size_t IssueColumnOffset = 0;
+  bool FoundIssueToken = false;
+  std::ostringstream LineBuff;
+  while (!Lexer.LexFromRawLexer(Token) && NextStart < 2) {
+    if (Token.isAtStartOfLine() && NextStart++ > 0)
+      continue;
+    const char *TokStart = SM.getCharacterData(Token.getLocation());
+    if (!FoundIssueToken && TokStart + Token.getLength() > IssuePos) {
+      // First token that is not entirely before the issue location: this is
+      // the token the issue starts at (covers the issue pointing at a token
+      // start, into a token, or at whitespace preceding it).
+      IssueColumnOffset = ColumnOffset;
+      FoundIssueToken = true;
+    }
+    LineBuff << std::string(TokStart, Token.getLength());
+    ColumnOffset += Token.getLength();
+  }
+  // The issue location lies past every token of the line (e.g. inside a
+  // trailing comment): attribute it to the end of the concatenation.
+  if (!FoundIssueToken)
+    IssueColumnOffset = ColumnOffset;
+
+  return {LineBuff.str(), IssueColumnOffset};
+}
+
 std::string clang::getIssueString(const FullSourceLoc &IssueLoc,
                                   StringRef CheckerName,
                                   StringRef WarningMessage,
@@ -175,4 +241,28 @@ SmallString<32> clang::getIssueHash(const FullSourceLoc &IssueLoc,
 
   return GetMD5HashOfContent(getIssueString(
       IssueLoc, CheckerName, WarningMessage, IssueDecl, LangOpts));
+}
+
+std::string clang::getIssueStringV2(const FullSourceLoc &IssueLoc,
+                                    StringRef CheckerName,
+                                    const Decl *IssueDecl,
+                                    const LangOptions &LangOpts) {
+  static StringRef Delimiter = "$";
+
+  auto [Line, ColumnOffset] = GetNormalizedLineAndIssueColumnOffset(
+      IssueLoc.getManager(), IssueLoc, LangOpts);
+
+  return (llvm::Twine(CheckerName) + Delimiter +
+          GetEnclosingDeclContextSignature(IssueDecl) + Delimiter +
+          llvm::Twine(ColumnOffset) + Delimiter + Line)
+      .str();
+}
+
+SmallString<32> clang::getIssueHashV2(const FullSourceLoc &IssueLoc,
+                                      StringRef CheckerName,
+                                      const Decl *IssueDecl,
+                                      const LangOptions &LangOpts) {
+
+  return GetMD5HashOfContent(
+      getIssueStringV2(IssueLoc, CheckerName, IssueDecl, LangOpts));
 }

@@ -50,6 +50,7 @@ class ExprInspectionChecker
   void analyzerDumpExtent(const CallExpr *CE, CheckerContext &C) const;
   void analyzerDumpElementCount(const CallExpr *CE, CheckerContext &C) const;
   void analyzerHashDump(const CallExpr *CE, CheckerContext &C) const;
+  void analyzerHashDumpV2(const CallExpr *CE, CheckerContext &C) const;
   void analyzerDenote(const CallExpr *CE, CheckerContext &C) const;
   void analyzerExpress(const CallExpr *CE, CheckerContext &C) const;
   void analyzerIsTainted(const CallExpr *CE, CheckerContext &C) const;
@@ -115,6 +116,8 @@ bool ExprInspectionChecker::evalCall(const CallEvent &Call,
                 &ExprInspectionChecker::analyzerNumTimesReached)
           .Case("clang_analyzer_hashDump",
                 &ExprInspectionChecker::analyzerHashDump)
+          .Case("clang_analyzer_hashDumpV2",
+                &ExprInspectionChecker::analyzerHashDumpV2)
           .Case("clang_analyzer_denote", &ExprInspectionChecker::analyzerDenote)
           .Case("clang_analyzer_express", // This also marks the argument as
                                           // interesting.
@@ -432,6 +435,19 @@ void ExprInspectionChecker::analyzerHashDump(const CallExpr *CE,
   FullSourceLoc FL(CE->getArg(0)->getBeginLoc(), SM);
   std::string HashContent = getIssueString(FL, getName(), "Category",
                                            C.getStackFrame()->getDecl(), Opts);
+
+  reportBug(HashContent, C);
+}
+
+// Test-only probe for the codeXek v2 issue hash: dumps the unhashed v2
+// string (checker $ enclosing signature $ token-relative column $ line).
+void ExprInspectionChecker::analyzerHashDumpV2(const CallExpr *CE,
+                                               CheckerContext &C) const {
+  const LangOptions &Opts = C.getLangOpts();
+  const SourceManager &SM = C.getSourceManager();
+  FullSourceLoc FL(CE->getArg(0)->getBeginLoc(), SM);
+  std::string HashContent =
+      getIssueStringV2(FL, getName(), C.getStackFrame()->getDecl(), Opts);
 
   reportBug(HashContent, C);
 }

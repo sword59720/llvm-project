@@ -190,6 +190,7 @@ createRuleMapping(const std::vector<const PathDiagnostic *> &Diags,
 }
 
 static const llvm::StringRef IssueHashKey = "clang/issueHash/v1";
+static const llvm::StringRef IssueHashV2Key = "codexek/issueHash/v2";
 
 SarifResult
 SarifDiagnostics::createResult(const PathDiagnostic *Diag,
@@ -203,6 +204,19 @@ SarifDiagnostics::createResult(const PathDiagnostic *Diag,
   SmallVector<ThreadFlow, 8> Flows = createThreadFlows(Diag, LO);
 
   auto IssueHash = Diag->getIssueHash(SM, LO);
+
+  // codeXek v2 fingerprint, exported in parallel to v1 above: token-based
+  // relative column instead of the absolute one, and no message component,
+  // so the identity survives reformatting and message wording changes.
+  // The location basis mirrors PathDiagnostic::getIssueHash (uniqueing
+  // location when present) so both hashes describe the same position.
+  PathDiagnosticLocation UPDLoc = Diag->getUniqueingLoc();
+  FullSourceLoc FullLoc(
+      SM.getExpansionLoc(UPDLoc.isValid() ? UPDLoc.asLocation()
+                                          : Diag->getLocation().asLocation()),
+      SM);
+  SmallString<32> IssueHashV2 =
+      getIssueHashV2(FullLoc, CheckName, Diag->getDeclWithIssue(), LO);
 
   std::string HtmlReportURL;
   if (FM && !FM->empty()) {
@@ -227,6 +241,7 @@ SarifDiagnostics::createResult(const PathDiagnostic *Diag,
                     .setDiagnosticLevel(SarifResultLevel::Warning)
                     .addLocations({Range})
                     .addPartialFingerprint(IssueHashKey, IssueHash)
+                    .addPartialFingerprint(IssueHashV2Key, IssueHashV2)
                     .setHostedViewerURI(HtmlReportURL)
                     .setThreadFlows(Flows);
   return Result;

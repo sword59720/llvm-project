@@ -89,7 +89,8 @@
             "text": "tainted"
           },
           "partialFingerprints": {
-            "clang/issueHash/v1": "5c964815b8d6db3989bacdd308e657d0"
+            "clang/issueHash/v1": "5c964815b8d6db3989bacdd308e657d0",
+            "codexek/issueHash/v2": "644f3153331ee7b381fb3d669d11dd75"
           },
           "ruleId": "debug.TaintTest",
           "ruleIndex": 0
