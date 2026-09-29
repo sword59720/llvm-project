@@ -4,9 +4,13 @@
 // RUN:   -emit-pch -o %t/ctudir/onego-toplevel-other.cpp.ast %S/Inputs/onego-toplevel-other.cpp
 // RUN: cp %S/Inputs/onego-toplevel-other.cpp.externalDefMap.ast-dump.txt %t/ctudir/externalDefMap.txt
 
+// codeXek fork: checker-error-recover defaults to true in this fork;
+// these upstream expectations assert upstream sink semantics, so the
+// analysis invocations pin the upstream default explicitly. Recovery
+// cascade behavior itself is asserted in test/checker_recovery_test/.
 // RUN: %clang_analyze_cc1 -std=c++14 -triple x86_64-pc-linux-gnu \
 // RUN:   -analyzer-checker=core,debug.ExprInspection \
-// RUN:   -analyzer-config eagerly-assume=false \
+// RUN:   -analyzer-config eagerly-assume=false,checker-error-recover=false \
 // RUN:   -analyzer-config experimental-enable-naive-ctu-analysis=true \
 // RUN:   -analyzer-config ctu-dir=%t/ctudir \
 // RUN:   -analyzer-config ctu-phase1-inlining=none \
@@ -14,7 +18,7 @@
 
 // RUN: %clang_analyze_cc1 -std=c++14 -triple x86_64-pc-linux-gnu \
 // RUN:   -analyzer-checker=core,debug.ExprInspection \
-// RUN:   -analyzer-config eagerly-assume=false \
+// RUN:   -analyzer-config eagerly-assume=false,checker-error-recover=false \
 // RUN:   -analyzer-config experimental-enable-naive-ctu-analysis=true \
 // RUN:   -analyzer-config ctu-dir=%t/ctudir \
 // RUN:   -analyzer-config ctu-phase1-inlining=none \

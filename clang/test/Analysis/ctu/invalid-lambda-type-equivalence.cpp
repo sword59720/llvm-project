@@ -13,9 +13,14 @@
 // RUN: sed -e 's| .*api\.cpp| api.cpp.ast|' -e 's| .*isolate\.cpp| isolate.cpp.ast|' \
 // RUN:   %t/externalDefMap.tmp.txt > %t/externalDefMap.txt
 
+// codeXek fork: checker-error-recover defaults to true in this fork;
+// these upstream expectations assert upstream sink semantics, so the
+// analysis invocations pin the upstream default explicitly. Recovery
+// cascade behavior itself is asserted in test/checker_recovery_test/.
 // RUN: %clang_analyze_cc1 -std=c++20 \
 // RUN:   -analyzer-checker=core \
 // RUN:   -analyzer-config experimental-enable-naive-ctu-analysis=true \
+// RUN:   -analyzer-config checker-error-recover=false \
 // RUN:   -analyzer-config ctu-dir=%t \
 // RUN:   -verify %t/main.cpp
 

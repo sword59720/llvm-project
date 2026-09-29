@@ -2,9 +2,14 @@
 // RUN: mkdir -p %t
 // RUN: split-file %s %t
 //
+// codeXek fork: checker-error-recover defaults to true in this fork;
+// these upstream expectations assert upstream sink semantics, so the
+// analysis invocations pin the upstream default explicitly. Recovery
+// cascade behavior itself is asserted in test/checker_recovery_test/.
 // DEFINE: %{ctu_analysis} =  %clang_analyze_cc1 \
 // DEFINE:                        -analyzer-checker=core \
 // DEFINE:                        -analyzer-config experimental-enable-naive-ctu-analysis=true \
+// DEFINE:                        -analyzer-config checker-error-recover=false \
 // DEFINE:                        -analyzer-config ctu-dir=%t \
 // DEFINE:                        -verify
 
