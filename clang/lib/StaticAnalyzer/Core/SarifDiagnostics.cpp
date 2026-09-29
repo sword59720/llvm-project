@@ -95,7 +95,9 @@ static StringRef getRuleDescription(StringRef CheckName) {
 #include "clang/StaticAnalyzer/Checkers/Checkers.inc"
 #undef CHECKER
 #undef GET_CHECKERS
-      ;
+      // Plugin-registered checkers are absent from Checkers.inc; serialize
+      // without a description instead of hitting the fall-off UNREACHABLE.
+      .Default("");
 }
 
 static StringRef getRuleHelpURIStr(StringRef CheckName) {
@@ -106,7 +108,9 @@ static StringRef getRuleHelpURIStr(StringRef CheckName) {
 #include "clang/StaticAnalyzer/Checkers/Checkers.inc"
 #undef CHECKER
 #undef GET_CHECKERS
-      ;
+      // Plugin-registered checkers are absent from Checkers.inc; serialize
+      // without a description instead of hitting the fall-off UNREACHABLE.
+      .Default("");
 }
 
 static ThreadFlowImportance
@@ -239,6 +243,66 @@ void SarifDiagnostics::FlushDiagnosticsImpl(
   llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::OF_TextWithCRLF);
   if (EC) {
     llvm::errs() << "warning: could not create file: " << EC.message() << '\n';
+    return;
+  }
+
+  // codeXek's process boundary: one independent SARIF document per JSONL
+  // record. Do not accumulate a second all-findings JSON DOM in the engine.
+  if (StringRef(OutputFile).ends_with(".jsonl")) {
+    // json::Value(T_StringRef) borrows the buffer instead of copying it:
+    // keep the version string alive for the whole loop, a temporary here
+    // dangles and corrupts the serialized "version" field.
+    std::string ToolVersion = getClangFullVersion();
+    for (const PathDiagnostic *D : Diags) {
+      // createRun() appends to the writer's run list and createDocument()
+      // copies every accumulated run, so each record must use a fresh
+      // writer; a shared one would replay all earlier records' diagnostics
+      // in every later line (quadratic output, wrong evidence ownership).
+      SarifDocumentWriter RecordWriter(SM);
+      std::vector<const PathDiagnostic *> One{D};
+      RecordWriter.createRun("clang", "clang static analyzer", ToolVersion);
+      auto Rules = createRuleMapping(One, RecordWriter);
+      RecordWriter.appendResult(createResult(D, Rules, LO, FM));
+      auto Doc = RecordWriter.createDocument();
+      auto *Runs = Doc.getArray("runs");
+      auto *Results = (*Runs)[0].getAsObject()->getArray("results");
+      auto *Result = (*Results)[0].getAsObject();
+      // These are diagnostic evidence events, not a complete execution trace.
+      json::Array Events;
+      for (const auto &Piece : D->path.flatten(false)) {
+        StringRef Kind = "event";
+        switch (Piece->getKind()) {
+        case PathDiagnosticPiece::ControlFlow: Kind = "control_flow"; break;
+        case PathDiagnosticPiece::Call: Kind = "call"; break;
+        case PathDiagnosticPiece::Macro: Kind = "macro"; break;
+        case PathDiagnosticPiece::Note: Kind = "note"; break;
+        case PathDiagnosticPiece::PopUp: Kind = "popup"; break;
+        case PathDiagnosticPiece::Event: break;
+        }
+        // flatten() may materialize fresh temporary pieces (call enter/exit
+        // events); copy their strings so the JSON value does not borrow
+        // storage that dies with the temporary PathPieces.
+        json::Object Event{{"kind", Kind}, {"tag", Piece->getTagStr().str()},
+                           {"message", Piece->getString().str()},
+                           {"branch_basis", "unknown"}};
+        auto Loc = Piece->getLocation().asLocation().getExpansionLoc();
+        if (Loc.isValid()) {
+          Event["file"] = SM.getFilename(Loc);
+          Event["line"] = SM.getExpansionLineNumber(Loc);
+          Event["byte_column"] = SM.getExpansionColumnNumber(Loc);
+          auto Range = Piece->getLocation().asRange();
+          bool Invalid = false;
+          auto Text = Lexer::getSourceText(CharSourceRange::getTokenRange(Range), SM, LO, &Invalid);
+          if (!Invalid && Text.size() <= 4096) Event["source_text"] = Text;
+        }
+        Events.push_back(std::move(Event));
+      }
+      (*Result)["properties"] = json::Object{{"codexek/schema_version", 1},
+          {"codexek/events", std::move(Events)},
+          {"codexek/path_complete", false},
+          {"codexek/recovery_provenance", "unknown"}};
+      OS << json::Value(std::move(Doc)) << '\n';
+    }
     return;
   }
 

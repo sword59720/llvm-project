@@ -36,9 +36,70 @@
 #include <optional>
 #include <sstream>
 #include <tuple>
+#ifdef CLANG_ENABLE_CTU_SQLITE
+#include <sqlite3.h>
+#endif
 
 namespace clang {
 namespace cross_tu {
+
+
+// One connection per analysis process, pinned to an immutable snapshot file.
+// Prepared point queries use bounded SQLite pages, without a global symbol map.
+struct SQLiteCTUIndex {
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  sqlite3 *DB = nullptr;
+  sqlite3_stmt *Query = nullptr;
+  std::string Path;
+  ~SQLiteCTUIndex() {
+    sqlite3_finalize(Query);
+    if (DB) sqlite3_close(DB);
+  }
+  llvm::Error open(StringRef File) {
+    Path = File.str();
+    if (sqlite3_open_v2(Path.c_str(), &DB, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                        nullptr) != SQLITE_OK)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    // No mmap or per-symbol cache. SQLite's page cache is limited to 8 MiB.
+    if (sqlite3_exec(DB, "PRAGMA query_only=ON; PRAGMA mmap_size=0; "
+                        "PRAGMA cache_size=-8192; PRAGMA trusted_schema=OFF;",
+                     nullptr, nullptr, nullptr) != SQLITE_OK)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    sqlite3_stmt *Meta = nullptr;
+    if (sqlite3_prepare_v2(DB, "SELECT version, namespace FROM metadata", -1,
+                           &Meta, nullptr) != SQLITE_OK)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    bool Valid = sqlite3_step(Meta) == SQLITE_ROW && sqlite3_column_int(Meta, 0) == 1 &&
+                 sqlite3_column_type(Meta, 1) == SQLITE_TEXT;
+    std::string Namespace;
+    if (Valid) Namespace = reinterpret_cast<const char *>(sqlite3_column_text(Meta, 1));
+    Valid = Valid && sqlite3_step(Meta) == SQLITE_DONE;
+    sqlite3_finalize(Meta);
+    if (!Valid || sqlite3_prepare_v2(DB,
+        "SELECT ast FROM definitions WHERE namespace=?1 AND usr=?2 ORDER BY ast LIMIT 2",
+        -1, &Query, nullptr) != SQLITE_OK)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    sqlite3_bind_text(Query, 1, Namespace.c_str(), -1, SQLITE_TRANSIENT);
+    return llvm::Error::success();
+  }
+  llvm::Expected<std::string> lookup(StringRef USR) {
+    sqlite3_reset(Query);
+    sqlite3_bind_text(Query, 2, USR.data(), USR.size(), SQLITE_TRANSIENT);
+    int RC = sqlite3_step(Query);
+    if (RC == SQLITE_DONE)
+      return llvm::make_error<IndexError>(index_error_code::missing_definition);
+    if (RC != SQLITE_ROW || sqlite3_column_type(Query, 0) != SQLITE_TEXT)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    std::string AST = reinterpret_cast<const char *>(sqlite3_column_text(Query, 0));
+    RC = sqlite3_step(Query);
+    if (RC == SQLITE_ROW)
+      return llvm::make_error<IndexError>(index_error_code::multiple_definitions, Path);
+    if (RC != SQLITE_DONE)
+      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    return AST;
+  }
+#endif
+};
 
 namespace {
 
@@ -565,22 +626,13 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFunction(
   if (ASTCacheEntry == NameASTUnitMap.end()) {
     // Load the ASTUnit from the pre-dumped AST file specified by ASTFileName.
 
-    // Ensure that the Index is loaded, as we need to search in it.
-    if (llvm::Error IndexLoadError =
-            ensureCTUIndexLoaded(CrossTUDir, IndexName))
-      return std::move(IndexLoadError);
-
-    // Check if there is an entry in the index for the function.
-    auto It = NameFileMap.find(FunctionName);
-    if (It == NameFileMap.end()) {
-      ++NumNotInOtherTU;
-      return llvm::make_error<IndexError>(index_error_code::missing_definition);
-    }
+    auto ASTFile = getFileForFunction(FunctionName, CrossTUDir, IndexName);
+    if (!ASTFile) return ASTFile.takeError();
 
     // Search in the index for the filename where the definition of FunctionName
     // resides.
     if (llvm::Expected<ASTUnit *> FoundForFile =
-            getASTUnitForFile(It->second, DisplayCTUProgress)) {
+            getASTUnitForFile(*ASTFile, DisplayCTUProgress)) {
 
       // Update the cache.
       NameASTUnitMap[FunctionName] = *FoundForFile;
@@ -600,13 +652,21 @@ CrossTranslationUnitContext::ASTUnitStorage::getFileForFunction(
     StringRef FunctionName, StringRef CrossTUDir, StringRef IndexName) {
   if (llvm::Error IndexLoadError = ensureCTUIndexLoaded(CrossTUDir, IndexName))
     return std::move(IndexLoadError);
-  return NameFileMap[FunctionName];
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  if (DiskIndex) return DiskIndex->lookup(FunctionName);
+#endif
+  auto It = NameFileMap.find(FunctionName);
+  if (It == NameFileMap.end()) {
+    ++NumNotInOtherTU;
+    return llvm::make_error<IndexError>(index_error_code::missing_definition);
+  }
+  return It->second;
 }
 
 llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
     StringRef CrossTUDir, StringRef IndexName) {
   // Dont initialize if the map is filled.
-  if (!NameFileMap.empty())
+  if (IndexLoaded)
     return llvm::Error::success();
 
   // Get the absolute path to the index file.
@@ -616,9 +676,20 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
   else
     llvm::sys::path::append(IndexFile, IndexName);
 
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  if (StringRef(IndexFile).ends_with(".db")) {
+    auto Index = std::make_shared<SQLiteCTUIndex>();
+    if (auto Error = Index->open(IndexFile)) return Error;
+    DiskIndex = std::move(Index);
+    IndexLoaded = true;
+    return llvm::Error::success();
+  }
+#endif
+
   if (auto IndexMapping = parseCrossTUIndex(IndexFile)) {
     // Initialize member map.
-    NameFileMap = *IndexMapping;
+    NameFileMap = std::move(*IndexMapping);
+    IndexLoaded = true;
     return llvm::Error::success();
   } else {
     // Error while parsing CrossTU index file.

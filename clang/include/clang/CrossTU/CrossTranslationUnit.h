@@ -37,6 +37,8 @@ class TranslationUnitDecl;
 
 namespace cross_tu {
 
+struct SQLiteCTUIndex;
+
 enum class index_error_code {
   success = 0,
   unspecified = 1,
@@ -335,6 +337,8 @@ private:
 
     using IndexMapTy = BaseMapTy<std::string>;
     IndexMapTy NameFileMap;
+    std::shared_ptr<SQLiteCTUIndex> DiskIndex;
+    bool IndexLoaded = false;
 
     /// Loads the AST based on the identifier found in the index.
     ASTLoader Loader;
