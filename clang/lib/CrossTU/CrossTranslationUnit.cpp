@@ -184,18 +184,32 @@ struct SQLiteCTUIndex {
                  << " distance=" << Best << " candidates=" << Rows << "\n";
     return Verdict;
   }
+  // codeXek dependency events: every cross-TU query outcome is reported so
+  // the product can do dependency-driven incremental analysis (design
+  // part IV §2) — "imported" carries the AST file whose definitions this
+  // task actually consumed; "missing" is deduplicated per process because
+  // unresolved USRs are re-queried at every call site, and a later
+  // appearance of one must re-analyze tasks that conservatively evaluated
+  // the call.
+  llvm::StringSet<> ReportedMisses;
   llvm::Expected<std::string> lookup(StringRef USR, StringRef CallerSource) {
     std::string Chosen, AST;
     unsigned Best = 0;
     size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
-    if (Rows == 0)
+    if (Rows == 0) {
+      if (ReportedMisses.insert(USR).second)
+        llvm::errs() << "codexek-ctu: missing usr=" << USR
+                     << " caller=" << CallerSource << "\n";
       return llvm::make_error<IndexError>(index_error_code::missing_definition);
+    }
     if (Rows >= 2)
       // codeXek RF03: structured per-query resolution event; the product
       // keeps these per task so every duplicate choice is traceable.
       llvm::errs() << "codexek-ctu: resolved usr=" << USR
                    << " caller=" << CallerSource << " chosen=" << Chosen
                    << " distance=" << Best << " candidates=" << Rows << "\n";
+    llvm::errs() << "codexek-ctu: imported usr=" << USR
+                 << " caller=" << CallerSource << " ast=" << AST << "\n";
     return AST;
   }
 #endif
