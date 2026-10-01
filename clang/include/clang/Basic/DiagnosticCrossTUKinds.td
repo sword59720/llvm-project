@@ -19,8 +19,13 @@ def err_invlist_parsing : Error<
   "error parsing invocation list file: '%0' line: %1 "
   "'<source-file>: [<compiler>, <arg1>, ...]' YAML mapping format expected">;
 
-def err_multiple_def_index : Error<
-  "multiple definitions are found for the same key in index">;
+// codeXek fork: a duplicate definition is an ODR/build defect in the analyzed
+// project, not a reason to abort analysis. Degrade to a warning and let the
+// call be evaluated conservatively without importing either definition,
+// mirroring the triple-mismatch handling below.
+def warn_multiple_def_index : Warning<
+  "multiple definitions are found for the same key in index (line: %0); "
+  "the call is analyzed conservatively without importing any of them">;
 
 def warn_multiple_entries_invlist : Warning<
   "multiple invocations for '%0' are found in the invocation list">,

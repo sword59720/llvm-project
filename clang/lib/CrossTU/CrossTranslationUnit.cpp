@@ -69,33 +69,133 @@ struct SQLiteCTUIndex {
     if (sqlite3_prepare_v2(DB, "SELECT version, namespace FROM metadata", -1,
                            &Meta, nullptr) != SQLITE_OK)
       return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
-    bool Valid = sqlite3_step(Meta) == SQLITE_ROW && sqlite3_column_int(Meta, 0) == 1 &&
+    // Index schema v2 adds the candidate source path used for
+    // caller-proximity duplicate resolution.
+    bool Valid = sqlite3_step(Meta) == SQLITE_ROW && sqlite3_column_int(Meta, 0) == 2 &&
                  sqlite3_column_type(Meta, 1) == SQLITE_TEXT;
     std::string Namespace;
     if (Valid) Namespace = reinterpret_cast<const char *>(sqlite3_column_text(Meta, 1));
     Valid = Valid && sqlite3_step(Meta) == SQLITE_DONE;
     sqlite3_finalize(Meta);
     if (!Valid || sqlite3_prepare_v2(DB,
-        "SELECT ast FROM definitions WHERE namespace=?1 AND usr=?2 ORDER BY ast LIMIT 2",
+        "SELECT ast, source FROM definitions WHERE namespace=?1 AND usr=?2 ORDER BY source",
         -1, &Query, nullptr) != SQLITE_OK)
       return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
     sqlite3_bind_text(Query, 1, Namespace.c_str(), -1, SQLITE_TRANSIENT);
     return llvm::Error::success();
   }
-  llvm::Expected<std::string> lookup(StringRef USR) {
+  // Duplicate definitions resolve by caller proximity: upward directory
+  // hops from the calling TU's directory to the lowest common ancestor with
+  // each candidate's directory. The SQL ORDER BY source makes equal-distance
+  // ties resolve deterministically to the smallest source path. Uncomparable
+  // paths (empty / mapped) share the worst distance and also fall back to
+  // the lexical order.
+  static unsigned dirDistance(StringRef CallerDir, StringRef CandidateDir) {
+    if (CallerDir.empty() || CandidateDir.empty())
+      return std::numeric_limits<unsigned>::max() / 2;
+    SmallVector<StringRef, 32> A, B;
+    for (auto I = llvm::sys::path::begin(CallerDir),
+              E = llvm::sys::path::end(CallerDir);
+         I != E; ++I)
+      A.push_back(*I);
+    for (auto I = llvm::sys::path::begin(CandidateDir),
+              E = llvm::sys::path::end(CandidateDir);
+         I != E; ++I)
+      B.push_back(*I);
+    size_t LCA = 0, Max = std::min(A.size(), B.size());
+    while (LCA < Max && A[LCA] == B[LCA]) ++LCA;
+    return unsigned(A.size() - LCA);
+  }
+  // codeXek DU01: a definition that rode along with another import never
+  // Shared per-caller selection over a USR's candidate rows: best (smallest)
+  // directory distance from the caller's directory; ties and uncomparable
+  // distances resolve lexically because the query orders by the source path.
+  // Returns the candidate count (0 on index error) and, when count >= 1, the
+  // chosen source path, the winning distance and the chosen AST file.
+  size_t selectChosen(StringRef USR, StringRef CallerSource,
+                      std::string &Chosen, unsigned &Best,
+                      std::string &ChosenAST) {
     sqlite3_reset(Query);
     sqlite3_bind_text(Query, 2, USR.data(), USR.size(), SQLITE_TRANSIENT);
-    int RC = sqlite3_step(Query);
-    if (RC == SQLITE_DONE)
+    StringRef CallerDir = llvm::sys::path::parent_path(CallerSource);
+    // sqlite3_column_text buffers live only until the next step: copy.
+    Chosen.clear();
+    ChosenAST.clear();
+    Best = 0;
+    size_t Rows = 0;
+    while (true) {
+      int RC = sqlite3_step(Query);
+      if (RC == SQLITE_DONE) break;
+      if (RC != SQLITE_ROW || sqlite3_column_type(Query, 1) != SQLITE_TEXT)
+        return 0; // index error
+      ++Rows;
+      std::string Source = reinterpret_cast<const char *>(sqlite3_column_text(Query, 1));
+      std::string AST = sqlite3_column_type(Query, 0) == SQLITE_TEXT
+                            ? reinterpret_cast<const char *>(sqlite3_column_text(Query, 0))
+                            : std::string();
+      unsigned D = dirDistance(CallerDir, llvm::sys::path::parent_path(Source));
+      if (Rows == 1 || D < Best) { Best = D; Chosen = std::move(Source); ChosenAST = std::move(AST); }
+    }
+    return Rows;
+  }
+  // codeXek RF01-R: import-time candidate gate — the quiet variant used by
+  // the ASTImporter body veto. A foreign body may enter the analyzed TU only
+  // if it belongs to the candidate this caller's resolution chooses;
+  // single-candidate and non-indexed USRs and index errors never gate. A
+  // veto is visible as a distinct "suppressed" event (the product records
+  // it per task; unlike "degraded" it does not weaken absence evidence,
+  // because the chosen body remains loadable on demand).
+  bool mayImportBody(StringRef USR, StringRef CallerSource,
+                     StringRef DefinitionFile) {
+    std::string Chosen, ChosenAST;
+    unsigned Best = 0;
+    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    if (Rows < 2 || Chosen == DefinitionFile.str())
+      return true;
+    llvm::errs() << "codexek-ctu: suppressed usr=" << USR
+                 << " caller=" << CallerSource
+                 << " rejected=" << DefinitionFile
+                 << " chosen=" << Chosen << " candidates=" << Rows << "\n";
+    return false;
+  }
+  // passed the per-caller resolution. Before such a body inlines, the caller
+  // verifies it is the candidate the policy would choose: run the same
+  // distance/lexical selection and compare the chosen source with the
+  // definition's own file. Non-indexed and single-candidate USRs are always
+  // chosen; index errors do not gate (reported elsewhere).
+  bool isChosenCandidate(StringRef USR, StringRef CallerSource,
+                          StringRef DefinitionFile) {
+    std::string Chosen, ChosenAST;
+    unsigned Best = 0;
+    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    if (Rows == 0)
+      return true; // index error: do not gate
+    if (Rows < 2) return true;
+    bool Verdict = Chosen == DefinitionFile.str();
+    // codeXek RF01/RF03: a rejected passenger body degrades conservatively
+    // (the To-context cannot hold two bodies of one function, so the chosen
+    // candidate cannot be substituted in) — the degradation is recorded
+    // explicitly instead of being presented as a successful resolution.
+    // With the RF01-R import gate in place this should be unreachable for
+    // passengers; it stays as a use-site safety net.
+    llvm::errs() << (Verdict ? "codexek-ctu: kept" : "codexek-ctu: degraded")
+                 << " usr=" << USR << " caller=" << CallerSource
+                 << " imported=" << DefinitionFile << " chosen=" << Chosen
+                 << " distance=" << Best << " candidates=" << Rows << "\n";
+    return Verdict;
+  }
+  llvm::Expected<std::string> lookup(StringRef USR, StringRef CallerSource) {
+    std::string Chosen, AST;
+    unsigned Best = 0;
+    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
+    if (Rows == 0)
       return llvm::make_error<IndexError>(index_error_code::missing_definition);
-    if (RC != SQLITE_ROW || sqlite3_column_type(Query, 0) != SQLITE_TEXT)
-      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
-    std::string AST = reinterpret_cast<const char *>(sqlite3_column_text(Query, 0));
-    RC = sqlite3_step(Query);
-    if (RC == SQLITE_ROW)
-      return llvm::make_error<IndexError>(index_error_code::multiple_definitions, Path);
-    if (RC != SQLITE_DONE)
-      return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
+    if (Rows >= 2)
+      // codeXek RF03: structured per-query resolution event; the product
+      // keeps these per task so every duplicate choice is traceable.
+      llvm::errs() << "codexek-ctu: resolved usr=" << USR
+                   << " caller=" << CallerSource << " chosen=" << Chosen
+                   << " distance=" << Best << " candidates=" << Rows << "\n";
     return AST;
   }
 #endif
@@ -386,8 +486,13 @@ llvm::Expected<const T *> CrossTranslationUnitContext::getCrossTUDefinitionImpl(
   if (!LookupName)
     return llvm::make_error<IndexError>(
         index_error_code::failed_to_generate_usr);
+  llvm::SmallString<256> CallerSource;
+  if (auto MainFile = Context.getSourceManager().getFileEntryRefForID(
+          Context.getSourceManager().getMainFileID()))
+    CallerSource = MainFile->getName();
   llvm::Expected<ASTUnit *> ASTUnitOrError =
-      loadExternalAST(*LookupName, CrossTUDir, IndexName, DisplayCTUProgress);
+      loadExternalAST(*LookupName, CrossTUDir, IndexName, DisplayCTUProgress,
+                      CallerSource);
   if (!ASTUnitOrError)
     return ASTUnitOrError.takeError();
   ASTUnit *Unit = *ASTUnitOrError;
@@ -488,7 +593,7 @@ void CrossTranslationUnitContext::emitCrossTUDiagnostics(const IndexError &IE,
     return;
 
   case index_error_code::multiple_definitions:
-    Context.getDiagnostics().Report(Loc, diag::err_multiple_def_index)
+    Context.getDiagnostics().Report(Loc, diag::warn_multiple_def_index)
         << IE.getLineNum();
     return;
 
@@ -620,13 +725,13 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
 llvm::Expected<ASTUnit *>
 CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFunction(
     StringRef FunctionName, StringRef CrossTUDir, StringRef IndexName,
-    bool DisplayCTUProgress) {
+    bool DisplayCTUProgress, StringRef CallerSource) {
   // Try the cache first.
   auto ASTCacheEntry = NameASTUnitMap.find(FunctionName);
   if (ASTCacheEntry == NameASTUnitMap.end()) {
     // Load the ASTUnit from the pre-dumped AST file specified by ASTFileName.
 
-    auto ASTFile = getFileForFunction(FunctionName, CrossTUDir, IndexName);
+    auto ASTFile = getFileForFunction(FunctionName, CrossTUDir, IndexName, CallerSource);
     if (!ASTFile) return ASTFile.takeError();
 
     // Search in the index for the filename where the definition of FunctionName
@@ -649,11 +754,12 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFunction(
 
 llvm::Expected<std::string>
 CrossTranslationUnitContext::ASTUnitStorage::getFileForFunction(
-    StringRef FunctionName, StringRef CrossTUDir, StringRef IndexName) {
+    StringRef FunctionName, StringRef CrossTUDir, StringRef IndexName,
+    StringRef CallerSource) {
   if (llvm::Error IndexLoadError = ensureCTUIndexLoaded(CrossTUDir, IndexName))
     return std::move(IndexLoadError);
 #ifdef CLANG_ENABLE_CTU_SQLITE
-  if (DiskIndex) return DiskIndex->lookup(FunctionName);
+  if (DiskIndex) return DiskIndex->lookup(FunctionName, CallerSource);
 #endif
   auto It = NameFileMap.find(FunctionName);
   if (It == NameFileMap.end()) {
@@ -661,6 +767,29 @@ CrossTranslationUnitContext::ASTUnitStorage::getFileForFunction(
     return llvm::make_error<IndexError>(index_error_code::missing_definition);
   }
   return It->second;
+}
+
+bool CrossTranslationUnitContext::ASTUnitStorage::isChosenCandidate(
+    StringRef FunctionName, StringRef CallerSource,
+    StringRef DefinitionFile) const {
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  if (DiskIndex)
+    return DiskIndex->isChosenCandidate(FunctionName, CallerSource,
+                                        DefinitionFile);
+#endif
+  (void)FunctionName; (void)CallerSource; (void)DefinitionFile;
+  return true; // text index is single-row per USR: no duplicates to resolve
+}
+
+bool CrossTranslationUnitContext::ASTUnitStorage::mayImportBody(
+    StringRef FunctionName, StringRef CallerSource,
+    StringRef DefinitionFile) const {
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  if (DiskIndex)
+    return DiskIndex->mayImportBody(FunctionName, CallerSource, DefinitionFile);
+#endif
+  (void)FunctionName; (void)CallerSource; (void)DefinitionFile;
+  return true; // text index is single-row per USR: no duplicates to resolve
 }
 
 llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
@@ -699,7 +828,7 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
 
 llvm::Expected<ASTUnit *> CrossTranslationUnitContext::loadExternalAST(
     StringRef LookupName, StringRef CrossTUDir, StringRef IndexName,
-    bool DisplayCTUProgress) {
+    bool DisplayCTUProgress, StringRef CallerSource) {
   // FIXME: The current implementation only supports loading decls with
   //        a lookup name from a single translation unit. If multiple
   //        translation units contains decls with the same lookup name an
@@ -707,7 +836,7 @@ llvm::Expected<ASTUnit *> CrossTranslationUnitContext::loadExternalAST(
 
   // Try to get the value from the heavily cached storage.
   llvm::Expected<ASTUnit *> Unit = ASTStorage.getASTUnitForFunction(
-      LookupName, CrossTUDir, IndexName, DisplayCTUProgress);
+      LookupName, CrossTUDir, IndexName, DisplayCTUProgress, CallerSource);
 
   if (!Unit)
     return Unit.takeError();
@@ -988,6 +1117,10 @@ CrossTranslationUnitContext::getOrCreateASTImporter(ASTUnit *Unit) {
   ASTImporter *NewImporter = new ASTImporter(
       Context, Context.getSourceManager().getFileManager(), From,
       From.getSourceManager().getFileManager(), false, ImporterSharedSt);
+  // codeXek RF01-R: candidate selection constrains every body import from
+  // this foreign unit — explicit queries and incidental passengers alike.
+  NewImporter->setShouldImportFunctionBody(
+      [this](const FunctionDecl *FD) { return shouldImportForeignBody(FD); });
   ASTUnitImporterMap[From.getTranslationUnitDecl()].reset(NewImporter);
   return *NewImporter;
 }
@@ -997,6 +1130,59 @@ CrossTranslationUnitContext::getMacroExpansionContextForSourceLocation(
     const clang::SourceLocation &ToLoc) const {
   // FIXME: Implement: Record such a context for every imported ASTUnit; lookup.
   return std::nullopt;
+}
+
+// codeXek DU01: verify that an imported definition (explicitly queried or
+// transitively pulled in by another import) is the duplicate-resolution
+// winner for THIS caller TU. Bodies of other candidates must not inline —
+// their use would make diagnostics depend on import order.
+bool CrossTranslationUnitContext::isChosenCandidate(const Decl *D) const {
+  const SourceManager &SM = Context.getSourceManager();
+  const std::optional<std::string> LookupName = getLookupName(D);
+  if (!LookupName)
+    return true;
+  StringRef CallerSource;
+  if (auto MainFile = SM.getFileEntryRefForID(SM.getMainFileID()))
+    CallerSource = MainFile->getName();
+  // RF01-M: macro-generated definitions carry the macro-expansion location;
+  // resolve the spelling through it so the comparison uses the candidate's
+  // actual file. A location that still yields no file cannot be attributed
+  // to any candidate — never gate on it.
+  StringRef DefinitionFile = SM.getFilename(SM.getExpansionLoc(D->getLocation()));
+  if (DefinitionFile.empty())
+    return true;
+  return ASTStorage.isChosenCandidate(*LookupName, CallerSource,
+                                      DefinitionFile);
+}
+
+// codeXek RF01-R: unified candidate selection constrains imports. Every
+// foreign function body — the one this TU explicitly queries and any that
+// rides along with another import — may enter the analyzed AST only if it
+// belongs to the candidate this caller's duplicate resolution chooses.
+// A non-chosen body is imported as a declaration only (merged into the
+// redeclaration chain, parameters and type intact), so it cannot occupy
+// the chosen definition's place; the chosen body loads on demand through
+// the normal getCrossTUDefinition path. Diagnostics therefore never depend
+// on import order. Single-candidate and non-indexed functions never gate;
+// index errors never gate (they are reported through the lookup path).
+bool CrossTranslationUnitContext::shouldImportForeignBody(
+    const FunctionDecl *FromFD) {
+  const std::optional<std::string> LookupName = getLookupName(FromFD);
+  if (!LookupName)
+    return true;
+  const SourceManager &FromSM = FromFD->getASTContext().getSourceManager();
+  // RF01-M: same expansion-location rule on the import gate — a
+  // macro-generated definition must be attributed to its expansion file,
+  // and an unattributable location never gates.
+  StringRef DefinitionFile =
+      FromSM.getFilename(FromSM.getExpansionLoc(FromFD->getLocation()));
+  if (DefinitionFile.empty())
+    return true;
+  StringRef CallerSource;
+  if (auto MainFile = Context.getSourceManager().getFileEntryRefForID(
+          Context.getSourceManager().getMainFileID()))
+    CallerSource = MainFile->getName();
+  return ASTStorage.mayImportBody(*LookupName, CallerSource, DefinitionFile);
 }
 
 bool CrossTranslationUnitContext::isImportedAsNew(const Decl *ToDecl) const {

@@ -4175,10 +4175,17 @@ ExpectedDecl ASTNodeImporter::VisitFunctionDecl(FunctionDecl *D) {
       return std::move(Err);
 
   if (D->doesThisDeclarationHaveABody()) {
-    Error Err = ImportFunctionDeclBody(D, ToFunction);
+    // codeXek RF01-R: the embedding context may veto a foreign body. The
+    // declaration itself (parameters, type, redeclaration-chain merge,
+    // context registration below) is imported regardless — only the body
+    // stays out, so it cannot occupy the place of the definition the
+    // context intends to use for this TU.
+    if (Importer.shouldImportFunctionBody(D)) {
+      Error Err = ImportFunctionDeclBody(D, ToFunction);
 
-    if (Err)
-      return std::move(Err);
+      if (Err)
+        return std::move(Err);
+    }
   }
 
   // Import and set the original type in case we used another type.

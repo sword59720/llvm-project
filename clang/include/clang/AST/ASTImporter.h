@@ -28,6 +28,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include <functional>
 #include <optional>
 #include <utility>
 
@@ -223,6 +224,10 @@ class TypeSourceInfo;
     /// Whether to perform a minimal import.
     bool Minimal;
 
+    /// codeXek RF01-R: optional per-decl body-import veto (see
+    /// setShouldImportFunctionBody). Empty = import every body.
+    std::function<bool(const FunctionDecl *)> ShouldImportBody;
+
     ODRHandlingType ODRHandling;
 
     /// Whether the last diagnostic came from the "from" context.
@@ -312,6 +317,21 @@ class TypeSourceInfo;
     /// Whether the importer will perform a minimal import, creating
     /// to-be-completed forward declarations when possible.
     bool isMinimalImport() const { return Minimal; }
+
+    /// codeXek RF01-R: optional veto on importing a foreign function's
+    /// body. When set and returning false for a FunctionDecl that carries a
+    /// body, the declaration is still imported (and merged into the
+    /// redeclaration chain) but the body does not enter the target AST. The
+    /// static analyzer's CTU uses this so that per-caller duplicate
+    /// candidate selection — not import order — decides which definition's
+    /// body the analyzed TU ends up using.
+    void setShouldImportFunctionBody(
+        std::function<bool(const FunctionDecl *)> Should) {
+      ShouldImportBody = std::move(Should);
+    }
+    bool shouldImportFunctionBody(const FunctionDecl *FD) const {
+      return !ShouldImportBody || ShouldImportBody(FD);
+    }
 
     void setODRHandling(ODRHandlingType T) { ODRHandling = T; }
 

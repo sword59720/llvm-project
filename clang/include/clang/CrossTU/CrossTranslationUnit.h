@@ -171,7 +171,8 @@ public:
   llvm::Expected<ASTUnit *> loadExternalAST(StringRef LookupName,
                                             StringRef CrossTUDir,
                                             StringRef IndexName,
-                                            bool DisplayCTUProgress = false);
+                                            bool DisplayCTUProgress = false,
+                                            StringRef CallerSource = StringRef());
 
   /// This function merges a definition from a separate AST Unit into
   ///        the current one which was created by the compiler instance that
@@ -202,6 +203,17 @@ public:
 
   /// Returns true if the given Decl is newly created during the import.
   bool isImportedAsNew(const Decl *ToDecl) const;
+  /// codeXek: true when \p D is the duplicate-resolution winner for this
+  /// caller TU (transitively imported passengers of a losing candidate are
+  /// refused so diagnostics never depend on import order).
+  bool isChosenCandidate(const Decl *D) const;
+
+  /// codeXek RF01-R: import-time gate consulted for every foreign function
+  /// body before it enters this TU's AST (explicitly queried or pulled in
+  /// by another import). Returns false to import the declaration only, so
+  /// that per-caller candidate selection — not import order — decides
+  /// which body the analysis uses.
+  bool shouldImportForeignBody(const FunctionDecl *FromFD);
 
   /// Returns true if the given Decl is mapped (or created) during an import
   /// but there was an unrecoverable error (the AST node cannot be erased, it
@@ -308,7 +320,8 @@ private:
     llvm::Expected<ASTUnit *> getASTUnitForFunction(StringRef FunctionName,
                                                     StringRef CrossTUDir,
                                                     StringRef IndexName,
-                                                    bool DisplayCTUProgress);
+                                                    bool DisplayCTUProgress,
+                                                    StringRef CallerSource = StringRef());
     /// Identifies the path of the file which can be used to load the ASTUnit
     /// for a given function.
     ///
@@ -321,7 +334,14 @@ private:
     /// \return An Expected instance containing the filepath.
     llvm::Expected<std::string> getFileForFunction(StringRef FunctionName,
                                                    StringRef CrossTUDir,
-                                                   StringRef IndexName);
+                                                   StringRef IndexName,
+                                                   StringRef CallerSource = StringRef());
+    bool isChosenCandidate(StringRef FunctionName, StringRef CallerSource,
+                           StringRef DefinitionFile) const;
+    /// codeXek RF01-R: quiet import-time variant of the candidate check
+    /// (emits a distinct "suppressed" event when vetoing a body).
+    bool mayImportBody(StringRef FunctionName, StringRef CallerSource,
+                       StringRef DefinitionFile) const;
 
   private:
     llvm::Error ensureCTUIndexLoaded(StringRef CrossTUDir, StringRef IndexName);

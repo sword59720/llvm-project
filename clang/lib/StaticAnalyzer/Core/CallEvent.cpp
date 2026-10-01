@@ -601,6 +601,12 @@ RuntimeDefinition AnyFunctionCall::getRuntimeDefinition() const {
       // A newly created definition, but we had error(s) during the import.
       if (CTUCtx.hasError(Decl))
         return {};
+      // codeXek DU01: definitions pulled in as passengers of another import
+      // bypassed per-caller duplicate resolution. Only the candidate that
+      // resolution would choose for this caller may inline; anything else
+      // degrades conservatively so diagnostics never depend on import order.
+      if (!CTUCtx.isChosenCandidate(Decl))
+        return {};
       return RuntimeDefinition(Decl, /*Foreign=*/true);
     }
     return RuntimeDefinition(Decl, /*Foreign=*/false);
