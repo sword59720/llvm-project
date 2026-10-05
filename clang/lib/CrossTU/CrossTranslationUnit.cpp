@@ -26,6 +26,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/IOSandbox.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLParser.h"
@@ -43,6 +44,21 @@
 namespace clang {
 namespace cross_tu {
 
+// codeXek dependency-capture protocol v1 (N03): every cross-TU observable is
+// a single-line JSON object on stderr after the "codexek-ctu: " prefix.
+// JSON escaping makes values with spaces and non-ASCII unambiguous — the
+// legacy token format only worked while every value was whitespace-free.
+// The lifecycle markers give the product a completeness proof it cannot
+// fabricate itself: "capture-begin" when the index opens, "capture-end"
+// only from real consumer teardown (a killed or crashed engine never
+// reaches it), carrying the exact count of every EMITTED event kind so the
+// receiver can detect loss even on a zero-exit run.
+static void emitCTUEvent(std::initializer_list<llvm::json::Object::KV> Fields) {
+  // Object's initializer-list constructor is explicit, so call sites pass
+  // the field list and this helper does the direct-initialization.
+  llvm::errs() << "codexek-ctu: "
+               << llvm::json::Value(llvm::json::Object(Fields)) << "\n";
+}
 
 // One connection per analysis process, pinned to an immutable snapshot file.
 // Prepared point queries use bounded SQLite pages, without a global symbol map.
@@ -82,6 +98,12 @@ struct SQLiteCTUIndex {
         -1, &Query, nullptr) != SQLITE_OK)
       return llvm::make_error<IndexError>(index_error_code::invalid_index_format, Path);
     sqlite3_bind_text(Query, 1, Namespace.c_str(), -1, SQLITE_TRANSIENT);
+    // N03 lifecycle: the index is now the task's dependency oracle; its
+    // identity (path + namespace) anchors the events that follow.
+    emitCTUEvent({{"v", 1},
+                  {"kind", "capture-begin"},
+                  {"index", Path},
+                  {"namespace", std::move(Namespace)}});
     return llvm::Error::success();
   }
   // Duplicate definitions resolve by caller proximity: upward directory
@@ -152,10 +174,14 @@ struct SQLiteCTUIndex {
     size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
     if (Rows < 2 || Chosen == DefinitionFile.str())
       return true;
-    llvm::errs() << "codexek-ctu: suppressed usr=" << USR
-                 << " caller=" << CallerSource
-                 << " rejected=" << DefinitionFile
-                 << " chosen=" << Chosen << " candidates=" << Rows << "\n";
+    ++Suppressed;
+    emitCTUEvent({{"v", 1},
+                  {"kind", "suppressed"},
+                  {"usr", USR.str()},
+                  {"caller", CallerSource.str()},
+                  {"rejected", DefinitionFile.str()},
+                  {"chosen", std::move(Chosen)},
+                  {"candidates", Rows}});
     return false;
   }
   // passed the per-caller resolution. Before such a body inlines, the caller
@@ -178,10 +204,15 @@ struct SQLiteCTUIndex {
     // explicitly instead of being presented as a successful resolution.
     // With the RF01-R import gate in place this should be unreachable for
     // passengers; it stays as a use-site safety net.
-    llvm::errs() << (Verdict ? "codexek-ctu: kept" : "codexek-ctu: degraded")
-                 << " usr=" << USR << " caller=" << CallerSource
-                 << " imported=" << DefinitionFile << " chosen=" << Chosen
-                 << " distance=" << Best << " candidates=" << Rows << "\n";
+    if (Verdict) ++Kept; else ++Degraded;
+    emitCTUEvent({{"v", 1},
+                  {"kind", Verdict ? "kept" : "degraded"},
+                  {"usr", USR.str()},
+                  {"caller", CallerSource.str()},
+                  {"imported", DefinitionFile.str()},
+                  {"chosen", std::move(Chosen)},
+                  {"distance", Best},
+                  {"candidates", Rows}});
     return Verdict;
   }
   // codeXek dependency events: every cross-TU query outcome is reported so
@@ -192,24 +223,44 @@ struct SQLiteCTUIndex {
   // appearance of one must re-analyze tasks that conservatively evaluated
   // the call.
   llvm::StringSet<> ReportedMisses;
+  // N03 protocol counters — every counter counts EMITTED events (Queries is
+  // the raw lookup count and is informational), so the product's received
+  // tally must match exactly; any mismatch means the capture is incomplete.
+  unsigned long Queries = 0, Imported = 0, Missing = 0, Resolved = 0,
+                 Suppressed = 0, Kept = 0, Degraded = 0;
   llvm::Expected<std::string> lookup(StringRef USR, StringRef CallerSource) {
+    ++Queries;
     std::string Chosen, AST;
     unsigned Best = 0;
     size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
     if (Rows == 0) {
-      if (ReportedMisses.insert(USR).second)
-        llvm::errs() << "codexek-ctu: missing usr=" << USR
-                     << " caller=" << CallerSource << "\n";
+      if (ReportedMisses.insert(USR).second) {
+        ++Missing;
+        emitCTUEvent({{"v", 1},
+                      {"kind", "missing"},
+                      {"usr", USR.str()},
+                      {"caller", CallerSource.str()}});
+      }
       return llvm::make_error<IndexError>(index_error_code::missing_definition);
     }
-    if (Rows >= 2)
+    if (Rows >= 2) {
       // codeXek RF03: structured per-query resolution event; the product
       // keeps these per task so every duplicate choice is traceable.
-      llvm::errs() << "codexek-ctu: resolved usr=" << USR
-                   << " caller=" << CallerSource << " chosen=" << Chosen
-                   << " distance=" << Best << " candidates=" << Rows << "\n";
-    llvm::errs() << "codexek-ctu: imported usr=" << USR
-                 << " caller=" << CallerSource << " ast=" << AST << "\n";
+      ++Resolved;
+      emitCTUEvent({{"v", 1},
+                    {"kind", "resolved"},
+                    {"usr", USR.str()},
+                    {"caller", CallerSource.str()},
+                    {"chosen", std::move(Chosen)},
+                    {"distance", Best},
+                    {"candidates", Rows}});
+    }
+    ++Imported;
+    emitCTUEvent({{"v", 1},
+                  {"kind", "imported"},
+                  {"usr", USR.str()},
+                  {"caller", CallerSource.str()},
+                  {"ast", AST}}); // copy: AST is the lookup's return value
     return AST;
   }
 #endif
@@ -452,7 +503,13 @@ CrossTranslationUnitContext::CrossTranslationUnitContext(CompilerInstance &CI)
   }
 }
 
-CrossTranslationUnitContext::~CrossTranslationUnitContext() {}
+CrossTranslationUnitContext::~CrossTranslationUnitContext() {
+  // N03: consumer teardown is the real end of the dependency-capture
+  // lifecycle. A killed or crashed engine never gets here, so the absence
+  // of this marker in a task's stderr means the capture is incomplete and
+  // the result must not be finely reused.
+  ASTStorage.emitCaptureEnd();
+}
 
 std::optional<std::string>
 CrossTranslationUnitContext::getLookupName(const Decl *D) {
@@ -706,14 +763,33 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
     // Do not load if the limit is reached.
     if (!LoadGuard) {
       ++NumASTLoadThresholdReached;
+      // N03: an import capped by the load threshold ran with less
+      // information than its dependency set suggests — the capture stays
+      // complete (the event arrived) but the product sees the shortfall.
+      ++AstErrors;
+      if (SQLiteActive)
+        emitCTUEvent({{"v", 1},
+                      {"kind", "ast-load"},
+                      {"ast", FileName.str()},
+                      {"result", "threshold"}});
       return llvm::make_error<IndexError>(
           index_error_code::load_threshold_reached);
     }
 
     auto LoadAttempt = Loader.load(FileName);
 
-    if (!LoadAttempt)
+    if (!LoadAttempt) {
+      // N03: a failed AST load means a definition the index promised never
+      // entered the analysis — the task result must not be treated as
+      // proof of absence for whatever that body would have revealed.
+      ++AstErrors;
+      if (SQLiteActive)
+        emitCTUEvent({{"v", 1},
+                      {"kind", "ast-load"},
+                      {"ast", FileName.str()},
+                      {"result", "error"}});
       return LoadAttempt.takeError();
+    }
 
     std::unique_ptr<ASTUnit> LoadedUnit = std::move(LoadAttempt.get());
 
@@ -724,6 +800,12 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
     FileASTUnitMap[FileName] = std::move(LoadedUnit);
 
     LoadGuard.indicateLoadSuccess();
+    ++AstLoads;
+    if (SQLiteActive)
+      emitCTUEvent({{"v", 1},
+                    {"kind", "ast-load"},
+                    {"ast", FileName.str()},
+                    {"result", "ok"}});
 
     if (DisplayCTUProgress)
       llvm::errs() << "CTU loaded AST file: " << FileName << "\n";
@@ -732,6 +814,7 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
 
   } else {
     // Found in the cache.
+    ++AstHits;
     return ASTCacheEntry->second.get();
   }
 }
@@ -761,7 +844,10 @@ CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFunction(
       return FoundForFile.takeError();
     }
   } else {
-    // Found in the cache.
+    // Found in the cache: a query answered without touching the index or
+    // the filesystem (N03 counter; the dependency itself was already
+    // reported when the AST was first loaded).
+    ++AstHits;
     return ASTCacheEntry->second;
   }
 }
@@ -821,8 +907,15 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
 
 #ifdef CLANG_ENABLE_CTU_SQLITE
   if (StringRef(IndexFile).ends_with(".db")) {
+    SQLiteActive = true;
     auto Index = std::make_shared<SQLiteCTUIndex>();
-    if (auto Error = Index->open(IndexFile)) return Error;
+    if (auto Error = Index->open(IndexFile)) {
+      // N03: an unusable index fails every query without an event trail;
+      // count it so capture-end can tell the product this capture observed
+      // a broken oracle (repeated per retrying query).
+      ++IndexErrors;
+      return Error;
+    }
     DiskIndex = std::move(Index);
     IndexLoaded = true;
     return llvm::Error::success();
@@ -836,8 +929,44 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
     return llvm::Error::success();
   } else {
     // Error while parsing CrossTU index file.
+    ++IndexErrors;
     return IndexMapping.takeError();
   };
+}
+
+// N03 lifecycle: the one completeness proof the product cannot fabricate.
+// Reaching consumer teardown means every cross-TU observable of this
+// analysis has been emitted; the marker carries the exact EMITTED-event
+// tally so a receiver that lost lines (truncation, pipe drop, redirect
+// mid-run) detects the mismatch and treats the capture as incomplete.
+// Emitted only when CTU was configured: plain analyses have no cross-TU
+// capture to certify, and upstream stderr stays untouched.
+void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
+  // Protocol gate (N03): only SQLite-driven analyses — the product's only
+  // configuration — carry the marker. Text-index and no-CTU runs keep
+  // upstream stderr byte-identical; they have no cross-TU capture contract.
+  if (!SQLiteActive)
+    return;
+  llvm::json::Object End{{"v", 1},
+                         {"kind", "capture-end"},
+                         {"index_loaded", false},
+                         {"ast_loads", AstLoads},
+                         {"ast_hits", AstHits},
+                         {"ast_errors", AstErrors},
+                         {"index_errors", IndexErrors}};
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  if (DiskIndex) {
+    End["index_loaded"] = true;
+    End["queries"] = DiskIndex->Queries;
+    End["imported"] = DiskIndex->Imported;
+    End["missing"] = DiskIndex->Missing;
+    End["resolved"] = DiskIndex->Resolved;
+    End["suppressed"] = DiskIndex->Suppressed;
+    End["kept"] = DiskIndex->Kept;
+    End["degraded"] = DiskIndex->Degraded;
+  }
+#endif
+  llvm::errs() << "codexek-ctu: " << llvm::json::Value(std::move(End)) << "\n";
 }
 
 llvm::Expected<ASTUnit *> CrossTranslationUnitContext::loadExternalAST(

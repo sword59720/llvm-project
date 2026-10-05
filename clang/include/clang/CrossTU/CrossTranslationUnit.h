@@ -342,6 +342,11 @@ private:
     /// (emits a distinct "suppressed" event when vetoing a body).
     bool mayImportBody(StringRef FunctionName, StringRef CallerSource,
                        StringRef DefinitionFile) const;
+    /// codeXek N03 dependency-capture protocol: emit the capture-end
+    /// lifecycle marker with the exact tally of EMITTED events, so the
+    /// product can prove it received every event of a completed capture.
+    /// Only reached through normal consumer teardown — never on crash.
+    void emitCaptureEnd() const;
 
   private:
     llvm::Error ensureCTUIndexLoaded(StringRef CrossTUDir, StringRef IndexName);
@@ -359,6 +364,15 @@ private:
     IndexMapTy NameFileMap;
     std::shared_ptr<SQLiteCTUIndex> DiskIndex;
     bool IndexLoaded = false;
+
+    // codeXek N03 protocol counters, storage side (index-side counters live
+    // in SQLiteCTUIndex): counts of EMITTED events plus observed index
+    // load failures. capture-end carries them for receiver verification.
+    unsigned long AstLoads = 0, AstHits = 0, AstErrors = 0, IndexErrors = 0;
+    /// Protocol gate: events (including capture-end) fire only when a
+    /// SQLite index was ATTEMPTED. Text-index and no-CTU analyses keep
+    /// upstream stderr byte-identical; the product always drives .db.
+    bool SQLiteActive = false;
 
     /// Loads the AST based on the identifier found in the index.
     ASTLoader Loader;
