@@ -39,7 +39,7 @@
 // SQL: codexek-ctu: {"ast":"{{.*}}import.c.ast","caller":"{{.*}}","kind":"imported","usr":"{{.+}}","v":1}
 // SQL: codexek-ctu: {"ast":"{{.*}}import.c.ast","kind":"ast-load","result":"ok","v":1}
 // SQL: codexek-ctu: {"caller":"{{.*}}","kind":"missing","usr":"c:@F@test_missing_definition","v":1}
-// SQL: codexek-ctu: {"ast_errors":0,"ast_hits":{{[0-9]+}},"ast_loads":1,"degraded":0,"imported":1,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","missing":1,"queries":{{[0-9]+}},"resolved":0,"suppressed":0,"v":1}
+// SQL: codexek-ctu: {"ast_errors":0,"ast_hits":{{[0-9]+}},"ast_loads":1,"degraded":0,"import_errors":0,"imported":1,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","missing":1,"queries":{{[0-9]+}},"query_errors":0,"resolved":0,"suppressed":0,"v":1}
 // SQL-NOT: codexek-ctu
 
 void clang_analyzer_eval(int);

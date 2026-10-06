@@ -132,13 +132,17 @@ struct SQLiteCTUIndex {
   // Shared per-caller selection over a USR's candidate rows: best (smallest)
   // directory distance from the caller's directory; ties and uncomparable
   // distances resolve lexically because the query orders by the source path.
-  // Returns the candidate count (0 on index error) and, when count >= 1, the
-  // chosen source path, the winning distance and the chosen AST file.
-  size_t selectChosen(StringRef USR, StringRef CallerSource,
+  // Returns the candidate count and, when count >= 1, the chosen source
+  // path, the winning distance and the chosen AST file. CR02: a FAILED
+  // query (storage error, bind error, non-text row) returns nullopt and is
+  // reported as a "query-error" event — callers must never read it as "no
+  // definition"; only SQLITE_DONE with zero rows is a genuine miss.
+  std::optional<size_t> selectChosen(StringRef USR, StringRef CallerSource,
                       std::string &Chosen, unsigned &Best,
                       std::string &ChosenAST) {
     sqlite3_reset(Query);
-    sqlite3_bind_text(Query, 2, USR.data(), USR.size(), SQLITE_TRANSIENT);
+    if (sqlite3_bind_text(Query, 2, USR.data(), USR.size(), SQLITE_TRANSIENT) != SQLITE_OK)
+      return noteQueryError(USR, -1);
     StringRef CallerDir = llvm::sys::path::parent_path(CallerSource);
     // sqlite3_column_text buffers live only until the next step: copy.
     Chosen.clear();
@@ -149,7 +153,7 @@ struct SQLiteCTUIndex {
       int RC = sqlite3_step(Query);
       if (RC == SQLITE_DONE) break;
       if (RC != SQLITE_ROW || sqlite3_column_type(Query, 1) != SQLITE_TEXT)
-        return 0; // index error
+        return noteQueryError(USR, RC); // index error, not an empty result
       ++Rows;
       std::string Source = reinterpret_cast<const char *>(sqlite3_column_text(Query, 1));
       std::string AST = sqlite3_column_type(Query, 0) == SQLITE_TEXT
@@ -159,6 +163,17 @@ struct SQLiteCTUIndex {
       if (Rows == 1 || D < Best) { Best = D; Chosen = std::move(Source); ChosenAST = std::move(AST); }
     }
     return Rows;
+  }
+  // CR02: one EMITTED query-error event per failed index read; capture-end
+  // carries the tally so the product can refuse fine reuse of results that
+  // were produced against a broken oracle.
+  std::optional<size_t> noteQueryError(StringRef USR, int RC) {
+    ++QueryErrors;
+    emitCTUEvent({{"v", 1},
+                  {"kind", "query-error"},
+                  {"usr", USR.str()},
+                  {"sqlite_rc", RC}});
+    return std::nullopt;
   }
   // codeXek RF01-R: import-time candidate gate — the quiet variant used by
   // the ASTImporter body veto. A foreign body may enter the analyzed TU only
@@ -171,9 +186,9 @@ struct SQLiteCTUIndex {
                      StringRef DefinitionFile) {
     std::string Chosen, ChosenAST;
     unsigned Best = 0;
-    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
-    if (Rows < 2 || Chosen == DefinitionFile.str())
-      return true;
+    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    if (!Rows || *Rows < 2 || Chosen == DefinitionFile.str())
+      return true; // query error already reported; never gate on a broken read
     ++Suppressed;
     emitCTUEvent({{"v", 1},
                   {"kind", "suppressed"},
@@ -190,13 +205,13 @@ struct SQLiteCTUIndex {
   // definition's own file. Non-indexed and single-candidate USRs are always
   // chosen; index errors do not gate (reported elsewhere).
   bool isChosenCandidate(StringRef USR, StringRef CallerSource,
-                          StringRef DefinitionFile) {
+                         StringRef DefinitionFile) {
     std::string Chosen, ChosenAST;
     unsigned Best = 0;
-    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
-    if (Rows == 0)
-      return true; // index error: do not gate
-    if (Rows < 2) return true;
+    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    if (!Rows)
+      return true; // query error already reported: do not gate
+    if (*Rows < 2) return true;
     bool Verdict = Chosen == DefinitionFile.str();
     // codeXek RF01/RF03: a rejected passenger body degrades conservatively
     // (the To-context cannot hold two bodies of one function, so the chosen
@@ -212,7 +227,7 @@ struct SQLiteCTUIndex {
                   {"imported", DefinitionFile.str()},
                   {"chosen", std::move(Chosen)},
                   {"distance", Best},
-                  {"candidates", Rows}});
+                  {"candidates", *Rows}});
     return Verdict;
   }
   // codeXek dependency events: every cross-TU query outcome is reported so
@@ -227,13 +242,19 @@ struct SQLiteCTUIndex {
   // the raw lookup count and is informational), so the product's received
   // tally must match exactly; any mismatch means the capture is incomplete.
   unsigned long Queries = 0, Imported = 0, Missing = 0, Resolved = 0,
-                 Suppressed = 0, Kept = 0, Degraded = 0;
+                 Suppressed = 0, Kept = 0, Degraded = 0, QueryErrors = 0;
   llvm::Expected<std::string> lookup(StringRef USR, StringRef CallerSource) {
     ++Queries;
     std::string Chosen, AST;
     unsigned Best = 0;
-    size_t Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
-    if (Rows == 0) {
+    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
+    if (!Rows) {
+      // CR02: the query itself failed — the analyzer still degrades to
+      // "definition unavailable" (unchanged), but no "missing" event may
+      // claim a completed query found nothing.
+      return llvm::make_error<IndexError>(index_error_code::missing_definition);
+    }
+    if (*Rows == 0) {
       if (ReportedMisses.insert(USR).second) {
         ++Missing;
         emitCTUEvent({{"v", 1},
@@ -243,7 +264,7 @@ struct SQLiteCTUIndex {
       }
       return llvm::make_error<IndexError>(index_error_code::missing_definition);
     }
-    if (Rows >= 2) {
+    if (*Rows >= 2) {
       // codeXek RF03: structured per-query resolution event; the product
       // keeps these per task so every duplicate choice is traceable.
       ++Resolved;
@@ -253,7 +274,7 @@ struct SQLiteCTUIndex {
                     {"caller", CallerSource.str()},
                     {"chosen", std::move(Chosen)},
                     {"distance", Best},
-                    {"candidates", Rows}});
+                    {"candidates", *Rows}});
     }
     ++Imported;
     emitCTUEvent({{"v", 1},
@@ -581,6 +602,7 @@ llvm::Expected<const T *> CrossTranslationUnitContext::getCrossTUDefinitionImpl(
     // TODO: Pass the SourceLocation of the CallExpression for more precise
     // diagnostics.
     ++NumTripleMismatch;
+    ASTStorage.noteImportFailure("triple-mismatch"); // CR01
     return llvm::make_error<IndexError>(index_error_code::triple_mismatch,
                                         std::string(Unit->getMainFileName()),
                                         TripleTo.str(), TripleFrom.str());
@@ -593,6 +615,7 @@ llvm::Expected<const T *> CrossTranslationUnitContext::getCrossTUDefinitionImpl(
   // different dialects of C++.
   if (LangTo.CPlusPlus != LangFrom.CPlusPlus) {
     ++NumLangMismatch;
+    ASTStorage.noteImportFailure("lang-mismatch"); // CR01
     return llvm::make_error<IndexError>(
         index_error_code::lang_mismatch, std::string(Unit->getMainFileName()),
         getLangDescription(LangTo), getLangDescription(LangFrom));
@@ -616,6 +639,7 @@ llvm::Expected<const T *> CrossTranslationUnitContext::getCrossTUDefinitionImpl(
       LangTo.CPlusPlus17 != LangFrom.CPlusPlus17 ||
       LangTo.CPlusPlus20 != LangFrom.CPlusPlus20) {
     ++NumLangDialectMismatch;
+    ASTStorage.noteImportFailure("lang-dialect-mismatch"); // CR01
     return llvm::make_error<IndexError>(index_error_code::lang_dialect_mismatch,
                                         std::string(Unit->getMainFileName()),
                                         getLangDescription(LangTo),
@@ -625,6 +649,7 @@ llvm::Expected<const T *> CrossTranslationUnitContext::getCrossTUDefinitionImpl(
   TranslationUnitDecl *TU = Unit->getASTContext().getTranslationUnitDecl();
   if (const T *ResultDecl = findDefInDeclContext<T>(TU, *LookupName))
     return importDefinition(ResultDecl, Unit);
+  ASTStorage.noteImportFailure("definition-not-in-ast"); // CR01
   return llvm::make_error<IndexError>(index_error_code::failed_import);
 }
 
@@ -953,7 +978,9 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
                          {"ast_loads", AstLoads},
                          {"ast_hits", AstHits},
                          {"ast_errors", AstErrors},
-                         {"index_errors", IndexErrors}};
+                         {"index_errors", IndexErrors},
+                         {"query_errors", 0},
+                         {"import_errors", ImportErrors}};
 #ifdef CLANG_ENABLE_CTU_SQLITE
   if (DiskIndex) {
     End["index_loaded"] = true;
@@ -964,9 +991,24 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
     End["suppressed"] = DiskIndex->Suppressed;
     End["kept"] = DiskIndex->Kept;
     End["degraded"] = DiskIndex->Degraded;
+    End["query_errors"] = DiskIndex->QueryErrors;
   }
 #endif
   llvm::errs() << "codexek-ctu: " << llvm::json::Value(std::move(End)) << "\n";
+}
+
+// CR01: one EMITTED event per definition-import failure, regardless of
+// which gate rejected it (triple/language/dialect mismatch, definition
+// absent from the loaded AST, or ASTImporter error) — the analyzer's
+// behavior is unchanged, but the capture states the result used less
+// information than its dependency set claims.
+void CrossTranslationUnitContext::ASTUnitStorage::noteImportFailure(
+    llvm::StringRef Reason) {
+  ++ImportErrors;
+  if (SQLiteActive)
+    emitCTUEvent({{"v", 1},
+                  {"kind", "import-failed"},
+                  {"reason", Reason.str()}});
 }
 
 llvm::Expected<ASTUnit *> CrossTranslationUnitContext::loadExternalAST(
@@ -985,9 +1027,11 @@ llvm::Expected<ASTUnit *> CrossTranslationUnitContext::loadExternalAST(
     return Unit.takeError();
 
   // Check whether the backing pointer of the Expected is a nullptr.
-  if (!*Unit)
+  if (!*Unit) {
+    ASTStorage.noteImportFailure("ast-unreadable"); // CR01
     return llvm::make_error<IndexError>(
         index_error_code::failed_to_get_external_ast);
+  }
 
   return Unit;
 }
@@ -1206,19 +1250,23 @@ CrossTranslationUnitContext::importDefinitionImpl(const T *D, ASTUnit *Unit) {
 
   auto ToDeclOrError = Importer.Import(D);
   if (!ToDeclOrError) {
+    const char *Reason = "import-error"; // CR01: visible to the consumer
     handleAllErrors(ToDeclOrError.takeError(), [&](const ASTImportError &IE) {
       switch (IE.Error) {
       case ASTImportError::NameConflict:
         ++NumNameConflicts;
+        Reason = "name-conflict";
         break;
       case ASTImportError::UnsupportedConstruct:
         ++NumUnsupportedNodeFound;
+        Reason = "unsupported-construct";
         break;
       case ASTImportError::Unknown:
         llvm_unreachable("Unknown import error happened.");
         break;
       }
     });
+    ASTStorage.noteImportFailure(Reason);
     return llvm::make_error<IndexError>(index_error_code::failed_import);
   }
   auto *ToDecl = cast<T>(*ToDeclOrError);

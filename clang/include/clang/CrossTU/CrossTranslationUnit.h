@@ -347,6 +347,12 @@ private:
     /// product can prove it received every event of a completed capture.
     /// Only reached through normal consumer teardown — never on crash.
     void emitCaptureEnd() const;
+    /// codeXek CR01 (20261006 review): record a definition-import failure
+    /// (the index resolved and the AST loaded, but the definition never
+    /// entered the analyzed TU). Emits an "import-failed" event and feeds
+    /// the capture-end error count — such a result used less information
+    /// than its dependency set claims and must not be finely reused.
+    void noteImportFailure(llvm::StringRef Reason);
 
   private:
     llvm::Error ensureCTUIndexLoaded(StringRef CrossTUDir, StringRef IndexName);
@@ -368,7 +374,8 @@ private:
     // codeXek N03 protocol counters, storage side (index-side counters live
     // in SQLiteCTUIndex): counts of EMITTED events plus observed index
     // load failures. capture-end carries them for receiver verification.
-    unsigned long AstLoads = 0, AstHits = 0, AstErrors = 0, IndexErrors = 0;
+    unsigned long AstLoads = 0, AstHits = 0, AstErrors = 0, IndexErrors = 0,
+                  ImportErrors = 0;
     /// Protocol gate: events (including capture-end) fire only when a
     /// SQLite index was ATTEMPTED. Text-index and no-CTU analyses keep
     /// upstream stderr byte-identical; the product always drives .db.
