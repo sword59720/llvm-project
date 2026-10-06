@@ -35,6 +35,18 @@
 //
 // SILENT-NOT: codexek-ctu
 //
+// S1-R02: a CONFIGURED .db index emits an explicit zero-counter end marker
+// even when zero queries ever opened it — the consumer must be able to
+// tell "no cross-TU use" apart from "protocol output lost".
+// RUN: echo 'int local_only(void){return 1;}' > %t/nocall.c
+// RUN: %clang_analyze_cc1 -analyzer-checker=core \
+// RUN:   -analyzer-config experimental-enable-naive-ctu-analysis=true \
+// RUN:   -analyzer-config ctu-dir=%t/ctudir -analyzer-config ctu-index-name=unused.db \
+// RUN:   %t/nocall.c 2>&1 | FileCheck %s --check-prefix=DBZERO
+//
+// DBZERO: codexek-ctu: {"ast_errors":0,"ast_hits":0,"ast_loads":0,"import_errors":0,"index_errors":0,"index_loaded":false,"kind":"capture-end","query_errors":0,"v":1}
+// DBZERO-NOT: codexek-ctu
+//
 // SQL: codexek-ctu: {"index":"{{.+}}index.db","kind":"capture-begin","namespace":"lit","v":1}
 // SQL: codexek-ctu: {"ast":"{{.*}}import.c.ast","caller":"{{.*}}","kind":"imported","usr":"{{.+}}","v":1}
 // SQL: codexek-ctu: {"ast":"{{.*}}import.c.ast","kind":"ast-load","result":"ok","v":1}

@@ -776,7 +776,10 @@ CrossTranslationUnitContext::ASTUnitStorage::ASTUnitStorage(
              CI.getAnalyzerOpts().CTUInvocationList),
       LoadGuard(CI.getASTContext().getLangOpts().CPlusPlus
                     ? CI.getAnalyzerOpts().CTUImportCppThreshold
-                    : CI.getAnalyzerOpts().CTUImportThreshold) {}
+                    : CI.getAnalyzerOpts().CTUImportThreshold),
+      DBIndexConfigured(!CI.getAnalyzerOpts().CTUDir.empty() &&
+                        llvm::StringRef(CI.getAnalyzerOpts().CTUIndexName)
+                            .ends_with(".db")) {}
 
 llvm::Expected<ASTUnit *>
 CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
@@ -970,7 +973,10 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
   // Protocol gate (N03): only SQLite-driven analyses — the product's only
   // configuration — carry the marker. Text-index and no-CTU runs keep
   // upstream stderr byte-identical; they have no cross-TU capture contract.
-  if (!SQLiteActive)
+  // S1-R02: a CONFIGURED .db index emits the marker even when it was never
+  // opened (zero queries) — absence of the marker then unambiguously means
+  // protocol loss, and the consumer may treat it as an incomplete capture.
+  if (!SQLiteActive && !DBIndexConfigured)
     return;
   llvm::json::Object End{{"v", 1},
                          {"kind", "capture-end"},

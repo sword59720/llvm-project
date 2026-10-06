@@ -380,6 +380,12 @@ private:
     /// SQLite index was ATTEMPTED. Text-index and no-CTU analyses keep
     /// upstream stderr byte-identical; the product always drives .db.
     bool SQLiteActive = false;
+    /// S1-R02 (20261006 review): a run configured for a .db index must end
+    /// with a capture-end marker even when zero queries ever opened the
+    /// index — otherwise the consumer cannot distinguish "no cross-TU use"
+    /// from "the whole protocol output was lost". Configured-but-unused
+    /// runs get an explicit index_loaded=false marker with zero counters.
+    bool DBIndexConfigured = false;
 
     /// Loads the AST based on the identifier found in the index.
     ASTLoader Loader;
