@@ -187,6 +187,20 @@ struct SQLiteCTUIndex {
     std::string Chosen, ChosenAST;
     unsigned Best = 0;
     auto Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    // FR01 (20261007 review): EVERY body-selection dependency is reported —
+    // including single-candidate and read-error cases, which previously
+    // produced no event at all. Passenger bodies (functions riding along
+    // with an explicitly queried import) influence the analysis exactly
+    // like queried ones; the consumer snapshots this USR's candidate set
+    // so any later candidate change invalidates the cached result.
+    ++BodyGates;
+    emitCTUEvent({{"v", 1},
+                  {"kind", "body-gate"},
+                  {"usr", USR.str()},
+                  {"caller", CallerSource.str()},
+                  {"chosen", Chosen},
+                  {"ast", ChosenAST},
+                  {"candidates", Rows ? uint64_t(*Rows) : 0}});
     if (!Rows || *Rows < 2 || Chosen == DefinitionFile.str())
       return true; // query error already reported; never gate on a broken read
     ++Suppressed;
@@ -242,7 +256,8 @@ struct SQLiteCTUIndex {
   // the raw lookup count and is informational), so the product's received
   // tally must match exactly; any mismatch means the capture is incomplete.
   unsigned long Queries = 0, Imported = 0, Missing = 0, Resolved = 0,
-                 Suppressed = 0, Kept = 0, Degraded = 0, QueryErrors = 0;
+                 Suppressed = 0, Kept = 0, Degraded = 0, QueryErrors = 0,
+                 BodyGates = 0;
   llvm::Expected<std::string> lookup(StringRef USR, StringRef CallerSource) {
     ++Queries;
     std::string Chosen, AST;
@@ -986,7 +1001,8 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
                          {"ast_errors", AstErrors},
                          {"index_errors", IndexErrors},
                          {"query_errors", 0},
-                         {"import_errors", ImportErrors}};
+                         {"import_errors", ImportErrors},
+                         {"body_gates", 0}};
 #ifdef CLANG_ENABLE_CTU_SQLITE
   if (DiskIndex) {
     End["index_loaded"] = true;
@@ -998,6 +1014,7 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
     End["kept"] = DiskIndex->Kept;
     End["degraded"] = DiskIndex->Degraded;
     End["query_errors"] = DiskIndex->QueryErrors;
+    End["body_gates"] = DiskIndex->BodyGates;
   }
 #endif
   llvm::errs() << "codexek-ctu: " << llvm::json::Value(std::move(End)) << "\n";
