@@ -32,8 +32,8 @@
 // RUN:   -analyzer-config ctu-dir=%t/ctudir -analyzer-config ctu-index-name=passenger.db \
 // RUN:   %t/passenger-entry.c 2>&1 | FileCheck %s --check-prefix=PASS
 //
-// PASS: codexek-ctu: {"ast":"{{.*}}passenger.ast","caller":"{{.*}}","candidates":1,"chosen":"{{.*}}passenger-callee.c","kind":"body-gate","usr":"c:@F@get_pointer","v":1}
-// PASS: codexek-ctu: {"ast_errors":0,"ast_hits":0,"ast_loads":1,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":0,"imported":1,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","missing":0,"queries":1,"query_errors":0,"resolved":0,"suppressed":0,"v":1}
+// PASS: codexek-ctu: {"ast":"{{.*}}passenger.ast","caller":"{{.*}}","candidates":1,"chosen":"{{.*}}passenger-callee.c","decision":"no-info","kind":"body-gate","usr":"c:@F@get_pointer","v":1}
+// PASS: codexek-ctu: {"ast_errors":0,"ast_hits":0,"ast_loads":1,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":0,"imported":1,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","link_closure_errors":0,"link_conflicts":0,"link_defects":0,"link_resolutions":0,"missing":0,"queries":1,"query_errors":0,"resolved":0,"suppressed":0,"v":1}
 // PASS-NOT: codexek-ctu
 // RUN: %clang_cc1 -emit-pch -o %t/ctudir/import.c.ast %S/Inputs/import.c
 // RUN: %python %S/Inputs/mkctu.py --blob-source %S/Inputs/import.c.externalDefMap.ast-dump.txt %t/ctudir/import.c.ast %t/ctudir/blob.db
@@ -44,7 +44,7 @@
 //
 // BLOB: codexek-ctu: {"kind":"query-error"
 // BLOB-SAME: "usr":"c:@F@testStaticImplicit"
-// BLOB: codexek-ctu: {"ast_errors":0,"ast_hits":0,"ast_loads":0,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":0,"imported":0,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","missing":0,"queries":{{[0-9]+}},"query_errors":1,"resolved":0,"suppressed":0,"v":1}
+// BLOB: codexek-ctu: {"ast_errors":0,"ast_hits":0,"ast_loads":0,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":0,"imported":0,"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","link_closure_errors":0,"link_conflicts":0,"link_defects":0,"link_resolutions":0,"missing":0,"queries":{{[0-9]+}},"query_errors":1,"resolved":0,"suppressed":0,"v":1}
 // BLOB-NOT: codexek-ctu
 //
 // Real import failure: the upstream test-import-failure fixture fails the
@@ -60,7 +60,7 @@
 //
 // IMPFAIL: codexek-ctu: {"kind":"import-failed"
 // IMPFAIL-SAME: "reason":"name-conflict"
-// IMPFAIL: codexek-ctu: {"ast_errors":0,"ast_hits":{{[0-9]+}},"ast_loads":1,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":1,"imported":{{[0-9]+}},"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","missing":0,"queries":{{[0-9]+}},"query_errors":0,"resolved":0,"suppressed":0,"v":1}
+// IMPFAIL: codexek-ctu: {"ast_errors":0,"ast_hits":{{[0-9]+}},"ast_loads":1,"body_gates":{{[0-9]+}},"degraded":0,"import_errors":1,"imported":{{[0-9]+}},"index_errors":0,"index_loaded":true,"kept":0,"kind":"capture-end","link_closure_errors":0,"link_conflicts":0,"link_defects":0,"link_resolutions":0,"missing":0,"queries":{{[0-9]+}},"query_errors":0,"resolved":0,"suppressed":0,"v":1}
 // IMPFAIL-NOT: codexek-ctu
 
 int testStaticImplicit(void);

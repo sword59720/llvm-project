@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include <optional>
 
 namespace clang {
@@ -385,6 +386,11 @@ private:
     // S-L2: per-task link-group closure file (design §438); read once
     // before the first CTU query. Empty = directory-proximity resolution.
     std::string LinkClosureFile;
+    // V2-09: the closure file is read through the analysis VFS — direct
+    // MemoryBuffer::getFile paths hit the IO sandbox the analysis process
+    // runs under. Captured at construction (cc1 builds the real FS before
+    // the frontend action starts).
+    IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS;
   public:
     void ensureLinkClosure();
     friend class CrossTranslationUnitContext;

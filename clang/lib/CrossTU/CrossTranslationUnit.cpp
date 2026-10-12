@@ -112,13 +112,14 @@ struct SQLiteCTUIndex {
     }
     return Out;
   }
-  void loadLinkClosure(StringRef Value) {
+  void loadLinkClosure(StringRef Value, llvm::vfs::FileSystem &FS) {
     LinkClosureLoaded = true;
     if (Value.empty()) return;
     // v2 base64: decode, then parse as JSON
     if (Value.starts_with("b64:")) {
       auto Decoded = base64Decode(Value.drop_front(4));
       if (Decoded) { loadClosureJson(*Decoded); return; }
+      ++LinkClosureErrors;
       emitCTUEvent({{"v", 1},
                     {"kind", "link-closure-error"},
                     {"error", "base64 decode failed"}});
@@ -131,8 +132,11 @@ struct SQLiteCTUIndex {
       return;
     }
     if (Value.starts_with("/")) {
-      // v2: file path — read from the task work directory
-      auto Buf = llvm::MemoryBuffer::getFile(Value);
+      // V2-09: file path — read through the analysis VFS. MemoryBuffer::
+      // getFile goes through llvm::sys::fs and hits the IO sandbox the
+      // analysis process runs under; VFS reads are the sanctioned channel
+      // (the same one AST dumps use).
+      auto Buf = FS.getBufferForFile(Value);
       if (Buf) { loadClosureJson((*Buf)->getBuffer()); return; }
       ++LinkClosureErrors;
       emitCTUEvent({{"v", 1},
@@ -141,26 +145,49 @@ struct SQLiteCTUIndex {
                     {"error", Buf.getError().message()}});
       return;
     }
-    // v1 fallback: pipe-separated paths (flat closure, no group identity)
+    // v1 fallback: pipe-separated paths (flat closure, no group identity).
+    // Modeled as ONE synthetic group so per-group resolution has a single
+    // code path regardless of the payload version.
     llvm::SmallVector<llvm::StringRef, 16> Items;
     Value.split(Items, '|');
     for (auto &P : Items) {
       auto T = P.trim();
       if (!T.empty()) LinkClosure.insert(T);
     }
+    if (!LinkClosure.empty()) {
+      ClosureGroup Synthetic;
+      Synthetic.Sources = LinkClosure;
+      LinkClosureGroups.push_back(std::move(Synthetic));
+    }
   }
   void loadClosureJson(StringRef Json) {
     auto Parsed = llvm::json::parse(Json);
     if (!Parsed) {
+      // V2-07: consume the Expected or an assertions build aborts on
+      // teardown with "Unchecked Expected<T>".
+      std::string Msg = llvm::toString(Parsed.takeError());
+      ++LinkClosureErrors;
       emitCTUEvent({{"v", 1},
                     {"kind", "link-closure-error"},
-                    {"error", "invalid JSON"}});
+                    {"error", "invalid JSON: " + Msg}});
       return;
     }
     auto *Root = Parsed->getAsObject();
-    if (!Root) return;
+    if (!Root) {
+      ++LinkClosureErrors;
+      emitCTUEvent({{"v", 1},
+                    {"kind", "link-closure-error"},
+                    {"error", "closure root is not a JSON object"}});
+      return;
+    }
     auto *Groups = Root->getArray("groups");
-    if (!Groups) return;
+    if (!Groups) {
+      ++LinkClosureErrors;
+      emitCTUEvent({{"v", 1},
+                    {"kind", "link-closure-error"},
+                    {"error", "closure JSON has no groups array"}});
+      return;
+    }
     LinkClosureIsJson = true;
     for (const auto &G : *Groups) {
       auto *Go = G.getAsObject();
@@ -250,9 +277,28 @@ struct SQLiteCTUIndex {
   unsigned long LinkResolutions = 0, LinkDefects = 0, LinkConflicts = 0,
                 LinkClosureErrors = 0;
 
+  // S-L2b (V2-01/V2-02): link resolution returns an explicit decision,
+  // not just a chosen path. NoInfo — no usable closure, level-2 directory
+  // proximity (previous behavior); Resolved — every binary containing the
+  // caller links the SAME definition (rule A); Ambiguous — some binary's
+  // closure holds >= 2 strong definitions of this USR (rule B: a
+  // build-consistency defect, NO pick, the caller degrades to "definition
+  // unavailable"); Conflict — the binaries disagree on the winner (rule C:
+  // recorded, then conservative directory-proximity fallback).
+  enum class LinkDecision { NoInfo, Resolved, Ambiguous, Conflict };
+  static const char *decisionName(LinkDecision D) {
+    switch (D) {
+    case LinkDecision::Resolved: return "resolved";
+    case LinkDecision::Ambiguous: return "ambiguous";
+    case LinkDecision::Conflict: return "conflict";
+    }
+    return "no-info";
+  }
+
   std::optional<size_t> selectChosen(StringRef USR, StringRef CallerSource,
                       std::string &Chosen, unsigned &Best,
-                      std::string &ChosenAST) {
+                      std::string &ChosenAST,
+                      LinkDecision &Decision) {
     sqlite3_reset(Query);
     if (sqlite3_bind_text(Query, 2, USR.data(), USR.size(), SQLITE_TRANSIENT) != SQLITE_OK)
       return noteQueryError(USR, -1);
@@ -261,63 +307,137 @@ struct SQLiteCTUIndex {
     Chosen.clear();
     ChosenAST.clear();
     Best = 0;
+    Decision = LinkDecision::NoInfo;
     size_t Rows = 0;
-    // S-L2 (design §438, rule A/B): with a closure loaded, filter candidates
-    // to the closure first. Exactly one in-closure definition wins outright;
-    // multiple in-closure strong definitions are a link-defect — reported
-    // with the full in-closure candidate set, no pick made (fall through to
-    // proximity so analysis still proceeds deterministically).
-    if (LinkClosureLoaded && !LinkClosure.empty()) {
+    if (LinkClosureLoaded && !LinkClosureGroups.empty()) {
+      // V2-02: decide PER GROUP, then compare the groups' conclusions
+      // (plan §438 rules A/B/C). Rows are collected once — re-stepping
+      // the finished statement for the proximity fallback would be
+      // SQLITE_MISUSE without a reset+rebind.
+      struct Cand {
+        std::string Source, AST;
+      };
+      std::vector<Cand> All;
+      std::vector<std::vector<size_t>> PerGroup(LinkClosureGroups.size());
       size_t ClosureRows = 0;
-      std::string ClosureChosen, ClosureAST;
       while (true) {
         int RC = sqlite3_step(Query);
         if (RC == SQLITE_DONE) break;
         if (RC != SQLITE_ROW || sqlite3_column_type(Query, 1) != SQLITE_TEXT)
           return noteQueryError(USR, RC);
-        std::string Source = reinterpret_cast<const char *>(sqlite3_column_text(Query, 1));
+        Cand C;
+        C.Source = reinterpret_cast<const char *>(sqlite3_column_text(Query, 1));
+        C.AST = sqlite3_column_type(Query, 0) == SQLITE_TEXT
+                    ? reinterpret_cast<const char *>(sqlite3_column_text(Query, 0))
+                    : std::string();
+        size_t Idx = All.size();
+        All.push_back(std::move(C));
         ++Rows;
-        if (!LinkClosure.contains(Source)) continue;
-        ++ClosureRows;
-        if (ClosureRows == 1) {
-          ClosureChosen = Source;
-          ClosureAST = sqlite3_column_type(Query, 0) == SQLITE_TEXT
-                           ? reinterpret_cast<const char *>(sqlite3_column_text(Query, 0))
-                           : std::string();
-        }
+        for (size_t G = 0; G < LinkClosureGroups.size(); ++G)
+          if (LinkClosureGroups[G].Sources.contains(All[Idx].Source)) {
+            PerGroup[G].push_back(Idx);
+            ++ClosureRows;
+          }
       }
-      if (ClosureRows == 1) {
-        Chosen = std::move(ClosureChosen);
-        ChosenAST = std::move(ClosureAST);
-        Best = 0; // closure win outranks any distance
+      // Rule B first: any binary whose closure contains two or more
+      // strong definitions of this USR is a build-consistency defect —
+      // report the full per-group candidate sets and forbid a pick (LR03).
+      bool Ambiguous = false;
+      for (const auto &G : PerGroup)
+        if (G.size() >= 2) {
+          Ambiguous = true;
+          break;
+        }
+      if (Ambiguous) {
+        ++LinkDefects;
+        llvm::json::Array JGroups;
+        for (size_t G = 0; G < PerGroup.size(); ++G) {
+          if (PerGroup[G].size() < 2) continue;
+          llvm::json::Array JC;
+          for (size_t I : PerGroup[G])
+            JC.push_back(llvm::json::Value(All[I].Source));
+          llvm::json::Object JG;
+          JG["binary"] = LinkClosureGroups[G].Binary;
+          JG["candidates"] = std::move(JC);
+          JGroups.push_back(llvm::json::Value(std::move(JG)));
+        }
+        emitCTUEvent({{"v", 1},
+                      {"kind", "link-defect"},
+                      {"usr", USR.str()},
+                      {"caller", CallerSource.str()},
+                      {"reason", "multiple-strong-defs-in-closure"},
+                      {"groups", std::move(JGroups)},
+                      {"all_candidates", uint64_t(Rows)}});
+        Decision = LinkDecision::Ambiguous;
+        return Rows; // Chosen stays empty: no pick under rule B
+      }
+      // Compare the per-group winners (each covered group now has at most
+      // one in-closure candidate).
+      llvm::StringSet<> Winners;
+      std::string Winner, WinnerAST;
+      for (const auto &G : PerGroup)
+        if (G.size() == 1) {
+          const Cand &W = All[G.front()];
+          if (Winners.insert(W.Source).second && Winners.size() == 1) {
+            Winner = W.Source;
+            WinnerAST = W.AST;
+          }
+        }
+      if (Winners.size() == 1) {
+        // Rule A: every binary containing the caller links the same
+        // definition — the link conclusion is authoritative.
         ++LinkResolutions;
         emitCTUEvent({{"v", 1},
                       {"kind", "link-resolution"},
                       {"usr", USR.str()},
                       {"caller", CallerSource.str()},
-                      {"chosen", Chosen},
+                      {"chosen", Winner},
+                      {"tier", "link-closure"},
+                      {"groups", uint64_t(LinkClosureGroups.size())},
                       {"closure_candidates", uint64_t(ClosureRows)},
                       {"all_candidates", uint64_t(Rows)}});
+        Chosen = std::move(Winner);
+        ChosenAST = std::move(WinnerAST);
+        Best = 0; // closure win outranks any distance
+        Decision = LinkDecision::Resolved;
         return Rows;
       }
-      // LR03: B class (ClosureRows > 1: multiple in-closure strong defs)
-      // and C class (ClosureRows == 0: definition outside the caller's
-      // closure) both LEAVE Chosen EMPTY — the caller's mayImportBody
-      // suppresses any body that isn't the explicit link winner, and
-      // isChosenCandidate rejects passenger imports. NO proximity
-      // fallback pick: the review requires "no pick" for B, and C means
-      // the definition belongs to another binary.
-      if (ClosureRows != 1) {
-        if (ClosureRows == 0) ++LinkConflicts; else ++LinkDefects;
+      if (Winners.size() >= 2) {
+        // Rule C: the binaries disagree on which definition is linked —
+        // record the conflict with the per-group winners, then fall back
+        // to conservative directory proximity (plan §438).
+        ++LinkConflicts;
+        llvm::json::Array JWinners;
+        for (size_t G = 0; G < PerGroup.size(); ++G)
+          if (PerGroup[G].size() == 1) {
+            llvm::json::Object JW;
+            JW["binary"] = LinkClosureGroups[G].Binary;
+            JW["winner"] = All[PerGroup[G].front()].Source;
+            JWinners.push_back(llvm::json::Value(std::move(JW)));
+          }
         emitCTUEvent({{"v", 1},
-                      {"kind", ClosureRows == 0 ? "link-conflict" : "link-defect"},
+                      {"kind", "link-conflict"},
                       {"usr", USR.str()},
                       {"caller", CallerSource.str()},
-                      {"closure_candidates", uint64_t(ClosureRows)},
+                      {"reason", "groups-disagree"},
+                      {"winners", std::move(JWinners)},
                       {"all_candidates", uint64_t(Rows)}});
-        // Chosen and ChosenAST stay empty: caller suppresses the body.
-        return Rows;
+        Decision = LinkDecision::Conflict;
+        // fall through to proximity below
       }
+      // Winners.empty(): all candidates sit OUTSIDE every group's closure —
+      // the link sidecar yields no conclusion for this USR (this is NOT a
+      // multi-group conflict, V2-02). Level-2 proximity, no link counter.
+      for (const Cand &C : All) {
+        unsigned D = dirDistance(CallerDir,
+                                 llvm::sys::path::parent_path(C.Source));
+        if (Chosen.empty() || D < Best) {
+          Best = D;
+          Chosen = C.Source;
+          ChosenAST = C.AST;
+        }
+      }
+      return Rows;
     }
     while (true) {
       int RC = sqlite3_step(Query);
@@ -356,7 +476,9 @@ struct SQLiteCTUIndex {
                      StringRef DefinitionFile) {
     std::string Chosen, ChosenAST;
     unsigned Best = 0;
-    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    LinkDecision Decision = LinkDecision::NoInfo;
+    auto Rows =
+        selectChosen(USR, CallerSource, Chosen, Best, ChosenAST, Decision);
     // FR01 (20261007 review): EVERY body-selection dependency is reported —
     // including single-candidate and read-error cases, which previously
     // produced no event at all. Passenger bodies (functions riding along
@@ -369,6 +491,7 @@ struct SQLiteCTUIndex {
                   {"usr", USR.str()},
                   {"caller", CallerSource.str()},
                   {"chosen", Chosen},
+                  {"decision", decisionName(Decision)},
                   {"ast", ChosenAST},
                   {"candidates", Rows ? uint64_t(*Rows) : 0}});
     if (!Rows || *Rows < 2 || Chosen == DefinitionFile.str())
@@ -392,7 +515,9 @@ struct SQLiteCTUIndex {
                          StringRef DefinitionFile) {
     std::string Chosen, ChosenAST;
     unsigned Best = 0;
-    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, ChosenAST);
+    LinkDecision Decision = LinkDecision::NoInfo;
+    auto Rows =
+        selectChosen(USR, CallerSource, Chosen, Best, ChosenAST, Decision);
     if (!Rows)
       return true; // query error already reported: do not gate
     if (*Rows < 2) return true;
@@ -432,7 +557,8 @@ struct SQLiteCTUIndex {
     ++Queries;
     std::string Chosen, AST;
     unsigned Best = 0;
-    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, AST);
+    LinkDecision Decision = LinkDecision::NoInfo;
+    auto Rows = selectChosen(USR, CallerSource, Chosen, Best, AST, Decision);
     if (!Rows) {
       // CR02: the query itself failed — the analyzer still degrades to
       // "definition unavailable" (unchanged), but no "missing" event may
@@ -447,6 +573,15 @@ struct SQLiteCTUIndex {
                       {"usr", USR.str()},
                       {"caller", CallerSource.str()}});
       }
+      return llvm::make_error<IndexError>(index_error_code::missing_definition);
+    }
+    if (Decision == LinkDecision::Ambiguous) {
+      // V2-01 (rule B): importing either definition is forbidden. Degrade
+      // to "definition unavailable" exactly like a miss so the analysis
+      // CONTINUES conservatively; the link-defect event already emitted is
+      // the product's build-consistency signal. Returning an empty-AST
+      // success here used to send the loader down the invocations.yaml
+      // path and fail the whole task.
       return llvm::make_error<IndexError>(index_error_code::missing_definition);
     }
     if (*Rows >= 2) {
@@ -973,7 +1108,8 @@ CrossTranslationUnitContext::ASTUnitStorage::ASTUnitStorage(
                     : CI.getAnalyzerOpts().CTUImportThreshold),
       DBIndexConfigured(!CI.getAnalyzerOpts().CTUDir.empty() &&
                         llvm::StringRef(CI.getAnalyzerOpts().CTUIndexName)
-                            .ends_with(".db")) {}
+                            .ends_with(".db")),
+      VFS(CI.getVirtualFileSystemPtr()) {}
 
 llvm::Expected<ASTUnit *>
 CrossTranslationUnitContext::ASTUnitStorage::getASTUnitForFile(
@@ -1120,7 +1256,7 @@ void CrossTranslationUnitContext::ASTUnitStorage::ensureLinkClosure() {
   // Idempotent: one read per process; the closure file is written by the
   // product per task before the engine invocation starts.
   if (DiskIndex && !DiskIndex->LinkClosureLoaded)
-    DiskIndex->loadLinkClosure(LinkClosureFile);
+    DiskIndex->loadLinkClosure(LinkClosureFile, *VFS);
 #endif
 }
 
@@ -1153,7 +1289,7 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
     // S-L2: closure loads AFTER the index is open (DiskIndex is set here);
     // calling earlier left DiskIndex null and silently skipped the closure.
     if (!LinkClosureFile.empty())
-      DiskIndex->loadLinkClosure(LinkClosureFile);
+      DiskIndex->loadLinkClosure(LinkClosureFile, *VFS);
     return llvm::Error::success();
   }
 #endif
@@ -1186,6 +1322,9 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
   // protocol loss, and the consumer may treat it as an incomplete capture.
   if (!SQLiteActive && !DBIndexConfigured)
     return;
+  // V2-04: ALL branches emit the full counter set — the consumer's
+  // mandatory-field check runs regardless of index_loaded, so a zero-query
+  // task that never opened the index still needs the link_* zeros.
   llvm::json::Object End{{"v", 1},
                          {"kind", "capture-end"},
                          {"index_loaded", false},
@@ -1195,7 +1334,11 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
                          {"index_errors", IndexErrors},
                          {"query_errors", 0},
                          {"import_errors", ImportErrors},
-                         {"body_gates", 0}};
+                         {"body_gates", 0},
+                         {"link_resolutions", 0},
+                         {"link_defects", 0},
+                         {"link_conflicts", 0},
+                         {"link_closure_errors", 0}};
 #ifdef CLANG_ENABLE_CTU_SQLITE
   if (DiskIndex) {
     End["index_loaded"] = true;
