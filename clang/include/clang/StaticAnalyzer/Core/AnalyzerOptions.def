@@ -541,6 +541,17 @@ ANALYZER_OPTION(
 ANALYZER_OPTION(StringRef, CTUDir, "ctu-dir",
                 "The directory containing the CTU related files.", "")
 
+ANALYZER_OPTION(StringRef, CTULinkClosure, "ctu-link-closure",
+                "codeXek S-L2 (design §438): path to a per-caller link-group "
+                "closure file listing the source files (one absolute path per "
+                "line) that are linked into the same binary as the analyzed "
+                "TU. When set, duplicate-definition resolution filters "
+                "candidates to this closure before directory proximity; "
+                "multiple in-closure strong definitions report as a "
+                "link-defect event instead of a pick. Empty (default) keeps "
+                "the level-2 directory-proximity behavior.",
+                "")
+
 ANALYZER_OPTION(StringRef, CTUIndexName, "ctu-index-name",
                 "The name of the file containing the CTU index of definitions. "
                 "The index file maps USR-names to identifiers. An identifier "

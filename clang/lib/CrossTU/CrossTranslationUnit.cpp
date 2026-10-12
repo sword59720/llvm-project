@@ -67,6 +67,115 @@ struct SQLiteCTUIndex {
   sqlite3 *DB = nullptr;
   sqlite3_stmt *Query = nullptr;
   std::string Path;
+  // S-L2 (design §438): per-caller link-group closure — absolute source
+  // paths linked into the same binary as the analyzed TU, one per line.
+  // Empty set = no closure (level-2 directory proximity, current behavior).
+  llvm::StringSet<> LinkClosure;
+  bool LinkClosureLoaded = false;
+  // Called right after the index opens: one engine invocation analyzes one
+  // task (one caller), so the closure is per-process and read once.
+  // S-L2a v2: closure is a JSON file in the task work directory (readable
+  // by the analysis process alongside input.i). Schema:
+  // {"schema":2,"groups":[{"binary":"...","sources":["..."]},...]}
+  // Each group preserves its binary identity — the engine resolves
+  // per-group and compares, enabling C-class conflict detection (LR02).
+  // v1 pipe-separated inline paths accepted for backward compatibility.
+  struct ClosureGroup {
+    std::string Binary;
+    llvm::StringSet<> Sources;
+  };
+  llvm::SmallVector<ClosureGroup, 4> LinkClosureGroups;
+  bool LinkClosureIsJson = false;
+  static std::optional<std::string> base64Decode(StringRef In) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string Out;
+    int vals[4], nv = 0;
+    for (char c : In) {
+      if (c == '=' || c == '\n' || c == '\r') continue;
+      const char *pos = strchr(tbl, c);
+      if (!pos) return std::nullopt;
+      vals[nv++] = int(pos - tbl);
+      if (nv == 4) {
+        Out += char((vals[0] << 2) | (vals[1] >> 4));
+        Out += char(((vals[1] & 0xF) << 4) | (vals[2] >> 2));
+        Out += char(((vals[2] & 0x3) << 6) | vals[3]);
+        nv = 0;
+      }
+    }
+    /* handle trailing partial group (no '=' padding) */
+    if (nv == 2)
+      Out += char((vals[0] << 2) | (vals[1] >> 4));
+    else if (nv == 3) {
+      Out += char((vals[0] << 2) | (vals[1] >> 4));
+      Out += char(((vals[1] & 0xF) << 4) | (vals[2] >> 2));
+    }
+    return Out;
+  }
+  void loadLinkClosure(StringRef Value) {
+    LinkClosureLoaded = true;
+    if (Value.empty()) return;
+    // v2 base64: decode, then parse as JSON
+    if (Value.starts_with("b64:")) {
+      auto Decoded = base64Decode(Value.drop_front(4));
+      if (Decoded) { loadClosureJson(*Decoded); return; }
+      emitCTUEvent({{"v", 1},
+                    {"kind", "link-closure-error"},
+                    {"error", "base64 decode failed"}});
+      return;
+    }
+    if (Value.starts_with("{\"schema\"")) {
+      // v2: inline JSON string (the product passes the file CONTENT here
+      // to avoid sandbox issues; the file is for audit only)
+      loadClosureJson(Value);
+      return;
+    }
+    if (Value.starts_with("/")) {
+      // v2: file path — read from the task work directory
+      auto Buf = llvm::MemoryBuffer::getFile(Value);
+      if (Buf) { loadClosureJson((*Buf)->getBuffer()); return; }
+      ++LinkClosureErrors;
+      emitCTUEvent({{"v", 1},
+                    {"kind", "link-closure-error"},
+                    {"file", Value.str()},
+                    {"error", Buf.getError().message()}});
+      return;
+    }
+    // v1 fallback: pipe-separated paths (flat closure, no group identity)
+    llvm::SmallVector<llvm::StringRef, 16> Items;
+    Value.split(Items, '|');
+    for (auto &P : Items) {
+      auto T = P.trim();
+      if (!T.empty()) LinkClosure.insert(T);
+    }
+  }
+  void loadClosureJson(StringRef Json) {
+    auto Parsed = llvm::json::parse(Json);
+    if (!Parsed) {
+      emitCTUEvent({{"v", 1},
+                    {"kind", "link-closure-error"},
+                    {"error", "invalid JSON"}});
+      return;
+    }
+    auto *Root = Parsed->getAsObject();
+    if (!Root) return;
+    auto *Groups = Root->getArray("groups");
+    if (!Groups) return;
+    LinkClosureIsJson = true;
+    for (const auto &G : *Groups) {
+      auto *Go = G.getAsObject();
+      if (!Go) continue;
+      ClosureGroup cg;
+      if (auto Bin = Go->getString("binary")) cg.Binary = Bin->str();
+      if (auto *Srcs = Go->getArray("sources"))
+        for (const auto &S : *Srcs)
+          if (auto Str = S.getAsString()) {
+            cg.Sources.insert(Str->str());
+            LinkClosure.insert(Str->str()); // flat set for quick membership
+          }
+      LinkClosureGroups.push_back(std::move(cg));
+    }
+  }
   ~SQLiteCTUIndex() {
     sqlite3_finalize(Query);
     if (DB) sqlite3_close(DB);
@@ -137,6 +246,10 @@ struct SQLiteCTUIndex {
   // query (storage error, bind error, non-text row) returns nullopt and is
   // reported as a "query-error" event — callers must never read it as "no
   // definition"; only SQLITE_DONE with zero rows is a genuine miss.
+  // S-L2b (LR06): counters for link-resolution family events
+  unsigned long LinkResolutions = 0, LinkDefects = 0, LinkConflicts = 0,
+                LinkClosureErrors = 0;
+
   std::optional<size_t> selectChosen(StringRef USR, StringRef CallerSource,
                       std::string &Chosen, unsigned &Best,
                       std::string &ChosenAST) {
@@ -149,6 +262,63 @@ struct SQLiteCTUIndex {
     ChosenAST.clear();
     Best = 0;
     size_t Rows = 0;
+    // S-L2 (design §438, rule A/B): with a closure loaded, filter candidates
+    // to the closure first. Exactly one in-closure definition wins outright;
+    // multiple in-closure strong definitions are a link-defect — reported
+    // with the full in-closure candidate set, no pick made (fall through to
+    // proximity so analysis still proceeds deterministically).
+    if (LinkClosureLoaded && !LinkClosure.empty()) {
+      size_t ClosureRows = 0;
+      std::string ClosureChosen, ClosureAST;
+      while (true) {
+        int RC = sqlite3_step(Query);
+        if (RC == SQLITE_DONE) break;
+        if (RC != SQLITE_ROW || sqlite3_column_type(Query, 1) != SQLITE_TEXT)
+          return noteQueryError(USR, RC);
+        std::string Source = reinterpret_cast<const char *>(sqlite3_column_text(Query, 1));
+        ++Rows;
+        if (!LinkClosure.contains(Source)) continue;
+        ++ClosureRows;
+        if (ClosureRows == 1) {
+          ClosureChosen = Source;
+          ClosureAST = sqlite3_column_type(Query, 0) == SQLITE_TEXT
+                           ? reinterpret_cast<const char *>(sqlite3_column_text(Query, 0))
+                           : std::string();
+        }
+      }
+      if (ClosureRows == 1) {
+        Chosen = std::move(ClosureChosen);
+        ChosenAST = std::move(ClosureAST);
+        Best = 0; // closure win outranks any distance
+        ++LinkResolutions;
+        emitCTUEvent({{"v", 1},
+                      {"kind", "link-resolution"},
+                      {"usr", USR.str()},
+                      {"caller", CallerSource.str()},
+                      {"chosen", Chosen},
+                      {"closure_candidates", uint64_t(ClosureRows)},
+                      {"all_candidates", uint64_t(Rows)}});
+        return Rows;
+      }
+      // LR03: B class (ClosureRows > 1: multiple in-closure strong defs)
+      // and C class (ClosureRows == 0: definition outside the caller's
+      // closure) both LEAVE Chosen EMPTY — the caller's mayImportBody
+      // suppresses any body that isn't the explicit link winner, and
+      // isChosenCandidate rejects passenger imports. NO proximity
+      // fallback pick: the review requires "no pick" for B, and C means
+      // the definition belongs to another binary.
+      if (ClosureRows != 1) {
+        if (ClosureRows == 0) ++LinkConflicts; else ++LinkDefects;
+        emitCTUEvent({{"v", 1},
+                      {"kind", ClosureRows == 0 ? "link-conflict" : "link-defect"},
+                      {"usr", USR.str()},
+                      {"caller", CallerSource.str()},
+                      {"closure_candidates", uint64_t(ClosureRows)},
+                      {"all_candidates", uint64_t(Rows)}});
+        // Chosen and ChosenAST stay empty: caller suppresses the body.
+        return Rows;
+      }
+    }
     while (true) {
       int RC = sqlite3_step(Query);
       if (RC == SQLITE_DONE) break;
@@ -547,6 +717,15 @@ CrossTranslationUnitContext::~CrossTranslationUnitContext() {
   ASTStorage.emitCaptureEnd();
 }
 
+bool CrossTranslationUnitContext::setLinkClosureFile(StringRef File) {
+  // One process = one task = one closure; late mismatched calls are refused.
+  if (ASTStorage.LinkClosureFile.empty()) {
+    ASTStorage.LinkClosureFile = File.str();
+    return true;
+  }
+  return ASTStorage.LinkClosureFile == File.str();
+}
+
 std::optional<std::string>
 CrossTranslationUnitContext::getLookupName(const Decl *D) {
   SmallString<128> DeclUSR;
@@ -900,6 +1079,7 @@ CrossTranslationUnitContext::ASTUnitStorage::getFileForFunction(
     StringRef FunctionName, StringRef CrossTUDir, StringRef IndexName,
     StringRef CallerSource) {
   if (llvm::Error IndexLoadError = ensureCTUIndexLoaded(CrossTUDir, IndexName))
+
     return std::move(IndexLoadError);
 #ifdef CLANG_ENABLE_CTU_SQLITE
   if (DiskIndex) return DiskIndex->lookup(FunctionName, CallerSource);
@@ -935,6 +1115,15 @@ bool CrossTranslationUnitContext::ASTUnitStorage::mayImportBody(
   return true; // text index is single-row per USR: no duplicates to resolve
 }
 
+void CrossTranslationUnitContext::ASTUnitStorage::ensureLinkClosure() {
+#ifdef CLANG_ENABLE_CTU_SQLITE
+  // Idempotent: one read per process; the closure file is written by the
+  // product per task before the engine invocation starts.
+  if (DiskIndex && !DiskIndex->LinkClosureLoaded)
+    DiskIndex->loadLinkClosure(LinkClosureFile);
+#endif
+}
+
 llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
     StringRef CrossTUDir, StringRef IndexName) {
   // Dont initialize if the map is filled.
@@ -961,6 +1150,10 @@ llvm::Error CrossTranslationUnitContext::ASTUnitStorage::ensureCTUIndexLoaded(
     }
     DiskIndex = std::move(Index);
     IndexLoaded = true;
+    // S-L2: closure loads AFTER the index is open (DiskIndex is set here);
+    // calling earlier left DiskIndex null and silently skipped the closure.
+    if (!LinkClosureFile.empty())
+      DiskIndex->loadLinkClosure(LinkClosureFile);
     return llvm::Error::success();
   }
 #endif
@@ -1015,6 +1208,10 @@ void CrossTranslationUnitContext::ASTUnitStorage::emitCaptureEnd() const {
     End["degraded"] = DiskIndex->Degraded;
     End["query_errors"] = DiskIndex->QueryErrors;
     End["body_gates"] = DiskIndex->BodyGates;
+    End["link_resolutions"] = DiskIndex->LinkResolutions;
+    End["link_defects"] = DiskIndex->LinkDefects;
+    End["link_conflicts"] = DiskIndex->LinkConflicts;
+    End["link_closure_errors"] = DiskIndex->LinkClosureErrors;
   }
 #endif
   llvm::errs() << "codexek-ctu: " << llvm::json::Value(std::move(End)) << "\n";

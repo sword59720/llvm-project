@@ -187,6 +187,12 @@ public:
   /// Get a name to identify a decl.
   static std::optional<std::string> getLookupName(const Decl *D);
 
+  /// codeXek S-L2 (design §438): register the per-task link-group closure
+  /// file (one absolute source path per line). The product writes it before
+  /// the engine invocation; the first CTU query loads it once. Empty =
+  /// level-2 directory-proximity resolution (default).
+  bool setLinkClosureFile(StringRef File);
+
   /// Emit diagnostics for the user for potential configuration errors.
   void emitCrossTUDiagnostics(const IndexError &IE, SourceLocation Loc);
 
@@ -376,6 +382,13 @@ private:
     using IndexMapTy = BaseMapTy<std::string>;
     IndexMapTy NameFileMap;
     std::shared_ptr<SQLiteCTUIndex> DiskIndex;
+    // S-L2: per-task link-group closure file (design §438); read once
+    // before the first CTU query. Empty = directory-proximity resolution.
+    std::string LinkClosureFile;
+  public:
+    void ensureLinkClosure();
+    friend class CrossTranslationUnitContext;
+  private:
     bool IndexLoaded = false;
 
     // codeXek N03 protocol counters, storage side (index-side counters live

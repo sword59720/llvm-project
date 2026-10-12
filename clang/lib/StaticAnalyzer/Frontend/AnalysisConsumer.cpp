@@ -302,9 +302,10 @@ public:
     if (VD->getAnyInitializer())
       return true;
 
+    CTU.setLinkClosureFile(Opts.CTULinkClosure);
     llvm::Expected<const VarDecl *> CTUDeclOrError =
-      CTU.getCrossTUDefinition(VD, Opts.CTUDir, Opts.CTUIndexName,
-                               Opts.DisplayCTUProgress);
+        CTU.getCrossTUDefinition(VD, Opts.CTUDir, Opts.CTUIndexName,
+                                 Opts.DisplayCTUProgress);
 
     if (!CTUDeclOrError) {
       handleAllErrors(CTUDeclOrError.takeError(),

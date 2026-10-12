@@ -616,6 +616,7 @@ RuntimeDefinition AnyFunctionCall::getRuntimeDefinition() const {
   if (!Opts.IsNaiveCTUEnabled)
     return {};
 
+  CTUCtx.setLinkClosureFile(Opts.CTULinkClosure);
   llvm::Expected<const FunctionDecl *> CTUDeclOrError =
       CTUCtx.getCrossTUDefinition(FD, Opts.CTUDir, Opts.CTUIndexName,
                                   Opts.DisplayCTUProgress);
