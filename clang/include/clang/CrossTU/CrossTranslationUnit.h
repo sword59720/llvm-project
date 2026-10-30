@@ -263,7 +263,14 @@ private:
   private:
     /// The style used for storage and lookup of filesystem paths.
     /// Defaults to posix.
+    // Windows drives are absolute only in the native style; the posix
+    // spelling misclassifies every drive path as relative (2026-10-30,
+    // first Windows bring-up).
+#ifdef _WIN32
+    const llvm::sys::path::Style PathStyle = llvm::sys::path::Style::windows;
+#else
     const llvm::sys::path::Style PathStyle = llvm::sys::path::Style::posix;
+#endif
 
     /// Loads an AST from a pch-dump.
     LoadResultTy loadFromDump(StringRef Identifier);
