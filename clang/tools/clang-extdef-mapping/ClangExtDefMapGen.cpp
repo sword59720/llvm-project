@@ -26,6 +26,11 @@
 #include "llvm/Support/WithColor.h"
 #include <optional>
 #include <string>
+#include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 using namespace llvm;
 using namespace clang;
@@ -199,6 +204,38 @@ static int HandleFiles(ArrayRef<std::string> SourceFiles,
 }
 
 int main(int argc, const char **argv) {
+#ifdef _WIN32
+  // The CRT decodes argv via the ANSI code page, so non-ASCII source paths
+  // arrive mangled and the tool reports "no such file or directory". Re-join
+  // the process command line through the wide API and re-encode as UTF-8 —
+  // the encoding every downstream LLVM/clang path helper expects.
+  static std::vector<std::string> ArgStorage;
+  static std::vector<const char *> ArgPtrs;
+  int WideArgc = 0;
+  if (LPWSTR *WideArgv = CommandLineToArgvW(GetCommandLineW(), &WideArgc)) {
+    bool Lossless = WideArgc == argc;
+    for (int I = 0; I < WideArgc && Lossless; ++I) {
+      int Bytes = WideCharToMultiByte(CP_UTF8, 0, WideArgv[I], -1, nullptr, 0,
+                                      nullptr, nullptr);
+      if (!Bytes) {
+        Lossless = false;
+        break;
+      }
+      ArgStorage.emplace_back(Bytes - 1, L'\0');
+      if (!WideCharToMultiByte(CP_UTF8, 0, WideArgv[I], -1,
+                               ArgStorage.back().data(), Bytes, nullptr,
+                               nullptr))
+        Lossless = false;
+    }
+    LocalFree(WideArgv);
+    if (Lossless) {
+      for (const auto &Arg : ArgStorage)
+        ArgPtrs.push_back(Arg.c_str());
+      argc = WideArgc;
+      argv = ArgPtrs.data();
+    }
+  }
+#endif
   // Print a stack trace if we signal out.
   sys::PrintStackTraceOnErrorSignal(argv[0], false);
   PrettyStackTraceProgram X(argc, argv);
