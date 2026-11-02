@@ -685,14 +685,11 @@ AnalysisConsumer::getModeForDecl(const Decl *D, AnalysisMode Mode) const {
     return AM_None;
   }
 
-  // Unless -analyze-all is specified, treat decls differently depending on
+  // Treat decls differently depending on
   // where they came from:
   // - Main source file: run both path-sensitive and non-path-sensitive checks.
   // - Header files: run non-path-sensitive checks only.
   // - System headers: don't run any checks.
-  if (Opts.AnalyzeAll)
-    return Mode;
-
   const SourceManager &SM = Ctx->getSourceManager();
 
   const SourceLocation Loc = [&SM](const Decl *D) -> SourceLocation {
@@ -705,8 +702,9 @@ AnalysisConsumer::getModeForDecl(const Decl *D, AnalysisMode Mode) const {
   if (Loc.isInvalid() || SM.isInSystemHeader(Loc))
     return AM_None;
 
-  // Disable path sensitive analysis in user-headers.
-  if (!Mgr->isInCodeFile(Loc))
+  // AnalyzeAll enables user headers, never system headers.
+  // Disable path sensitive analysis in user-headers unless requested.
+  if (!Opts.AnalyzeAll && !Mgr->isInCodeFile(Loc))
     return Mode & ~AM_Path;
 
   return Mode;

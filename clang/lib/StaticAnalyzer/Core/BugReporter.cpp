@@ -2976,6 +2976,13 @@ void BugReporter::emitReport(std::unique_ptr<BugReport> R) {
   if (!ValidSourceLoc)
     return;
 
+  // Classify the defect location, not the entry point or path notes: user
+  // code may inline a system-header function (and vice versa). Expansion
+  // locations keep macros invoked by user code attributable to that code.
+  const SourceManager &SM = getSourceManager();
+  if (SM.isInSystemHeader(SM.getExpansionLoc(R->getLocation().asLocation())))
+    return;
+
   // If the user asked to suppress this report, we should skip it.
   if (UserSuppressions.isSuppressed(*R))
     return;
