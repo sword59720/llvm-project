@@ -48,6 +48,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Support/Base64.h"
+#include "llvm/Support/JSON.h"
+#include "clang/Basic/FileManager.h"
+#include "clang/UnifiedSymbolResolution/USRGeneration.h"
+#include <set>
+#include <limits>
+#include "llvm/Support/SaveAndRestore.h"
 #include "AllocationState.h"
 #include "InterCheckerAPI.h"
 #include "NoOwnershipChangeVisitor.h"
@@ -251,6 +258,8 @@ public:
 } // end of anonymous namespace
 
 REGISTER_MAP_WITH_PROGRAMSTATE(RegionState, SymbolRef, RefState)
+using KBCallKey = std::pair<const Expr *, const StackFrame *>;
+REGISTER_MAP_WITH_PROGRAMSTATE(KBMemoryCalls, KBCallKey, unsigned)
 
 /// Check if the memory associated with this symbol was released.
 static bool isReleased(SymbolRef Sym, CheckerContext &C);
@@ -385,6 +394,167 @@ struct DynMemFrontend : virtual public CheckerFrontend, public BT_PROVIDERS... {
 // Definition of the MallocChecker class.
 //===----------------------------------------------------------------------===//
 
+// The product owns text parsing and group ordering. This reader validates the
+// versioned, frozen IR at the engine boundary and binds it to real declarations.
+struct KBMemoryRecord {
+  StringRef Family, File, Function;
+  unsigned Line = 0, Argument = 0;
+  bool Free = false, Always = true, Equal = true, MayFail = false;
+  unsigned GuardArgument = 0;
+  int64_t GuardValue = 0;
+};
+class KBMemoryIndex {
+  bool Loaded = false;
+  std::optional<llvm::json::Value> Data;
+  std::set<std::string> SourceDefinitions;
+  mutable std::set<std::string> Events;
+public:
+  void event(StringRef Kind, const KBMemoryRecord *Record, StringRef Reason, const CallEvent *Call = nullptr) const {
+    llvm::json::Object Event{{"kind", Kind}, {"reason", Reason}};
+    if (Record) {
+      Event["file"] = Record->File;
+      Event["line"] = int64_t(Record->Line);
+      Event["record_kind"] = Record->Free ? "FREE" : "ALLOC";
+      Event["function"] = Record->Function;
+    }
+    if (Call && Call->getOriginExpr()) {
+      auto Location=Call->getASTContext().getSourceManager().getPresumedLoc(Call->getOriginExpr()->getExprLoc());
+      if (Location.isValid()) {
+        Event["call_file"]=Location.getFilename();
+        Event["call_line"]=int64_t(Location.getLine());
+        Event["call_column"]=int64_t(Location.getColumn());
+      }
+    }
+    std::string Text;
+    llvm::raw_string_ostream Stream(Text);
+    Stream << llvm::json::Value(std::move(Event));
+    if (Events.insert(Text).second) llvm::errs() << "cx-kb: " << Text << '\n';
+  }
+  void load(CheckerContext &C) {
+    if (Loaded) return;
+    Loaded = true;
+    auto &Options = C.getAnalysisManager().getAnalyzerOptions();
+    if (Options.Config.lookup("cx.KB:NativeMemory") != "true") return;
+    auto Encoded = Options.Config.lookup("cx.KB:ConfigB64");
+    while (Encoded.size()%4) Encoded += '=';
+    std::vector<char> Decoded;
+    if (auto Error = llvm::decodeBase64(Encoded, Decoded)) {
+      event("degraded", nullptr, llvm::toString(std::move(Error))); return;
+    }
+    auto Buffer = C.getSourceManager().getFileManager().getBufferForFile(
+        StringRef(Decoded.data(), Decoded.size()));
+    if (!Buffer || (*Buffer)->getBufferSize()>64*1024*1024) {
+      event("degraded", nullptr, "cannot read KB memory snapshot"); return;
+    }
+    auto Parsed = llvm::json::parse((*Buffer)->getBuffer());
+    if (!Parsed) { event("degraded", nullptr, llvm::toString(Parsed.takeError())); return; }
+    const auto *Root = Parsed->getAsObject();
+    if (!Root || Root->getInteger("schema") != 1 || !Root->getArray("files")) {
+      event("degraded", nullptr, "unsupported KB memory schema"); return;
+    }
+    if (auto *Definitions = Root->getArray("source_definitions"))
+      for (const auto &Definition : *Definitions) {
+        auto USR = Definition.getAsString();
+        if (!USR) { event("degraded", nullptr, "invalid KB source index"); return; }
+        SourceDefinitions.insert(USR->str());
+      }
+    Data = std::move(*Parsed);
+    event("native-memory-v1", nullptr, "native MallocChecker KB adapter");
+  }
+  std::vector<KBMemoryRecord> group(const CallEvent &Call, bool Free) const {
+    if (!Data || !Call.getOriginExpr()) return {};
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || FD->hasBody() || FD->isVariadic() || FD->getBuiltinID() ||
+        FD->getTemplatedKind()!=FunctionDecl::TK_NonTemplate || FD->hasAttr<OwnershipAttr>()) return {};
+    if (const auto *MD = dyn_cast<CXXMethodDecl>(FD)) if (MD->isVirtual()) return {};
+    llvm::SmallString<128> USR;
+    if (index::generateUSRForDecl(FD, USR) || SourceDefinitions.count(USR.str().str())) return {};
+    std::set<const Decl *> Overloads;
+    for (const auto *D : FD->getDeclContext()->lookup(FD->getDeclName()))
+      if (const auto *F = dyn_cast<FunctionDecl>(D)) Overloads.insert(F->getCanonicalDecl());
+    if (Overloads.size()>1) return {};
+    PrintingPolicy Policy(Call.getASTContext().getLangOpts());
+    Policy.SuppressTagKeyword = true;
+    auto Signature = FD->getType().getCanonicalType().getAsString(Policy);
+    auto Name = FD->getQualifiedNameAsString();
+    const auto *Files = Data->getAsObject()->getArray("files");
+    for (size_t FileIndex=Files->size(); FileIndex>0; --FileIndex) {
+      const auto *FileObject = (*Files)[FileIndex-1].getAsObject();
+      const auto *Records = FileObject ? FileObject->getArray("records") : nullptr;
+      if (!Records) { event("degraded",nullptr,"invalid KB memory file"); return {}; }
+      for (bool Exact : {true, false}) {
+        std::vector<KBMemoryRecord> Result;
+        bool Valid = true;
+        for (const auto &Entry : *Records) {
+          const auto *R = Entry.getAsObject();
+          if (!R) { event("degraded",nullptr,"invalid KB memory record"); return {}; }
+          if (R->getString("function") != Name || R->getString("kind") != (Free ? "FREE" : "ALLOC")) continue;
+          auto S = R->getString("signature");
+          if (!S || (Exact ? *S!=Signature : !S->empty())) continue;
+          auto Model = bind(*R,Call,Free);
+          if (!Model) { Valid=false; event("binding-failed",nullptr,"incompatible KB memory record for "+Name,&Call); }
+          else Result.push_back(*Model);
+        }
+        if (Valid && !Result.empty()) return Result;
+      }
+    }
+    return {};
+  }
+  bool freeing(const CallEvent &Call) const {
+    return !group(Call,true).empty() && group(Call,false).empty();
+  }
+private:
+  std::optional<KBMemoryRecord> bind(const llvm::json::Object &R,
+                                     const CallEvent &Call, bool Free) const {
+    const auto *FD = cast<FunctionDecl>(Call.getDecl());
+    auto Family=R.getString("family"), File=R.getString("file");
+    auto Line=R.getInteger("line");
+    if (R.getInteger("schema")!=1 || !Family || Family->empty() || !File || !Line || *Line<=0 || uint64_t(*Line)>std::numeric_limits<unsigned>::max() ||
+        !R.getBoolean("unoverloaded")) return {};
+    KBMemoryRecord Model;
+    Model.Family=*Family; Model.File=*File; Model.Function=R.getString("function").value_or(""); Model.Line=unsigned(*Line); Model.Free=Free;
+    const auto *Target=R.getObject("target");
+    if (!Target) return {};
+    if (Free) {
+      if (R.get("entry") || R.get("success")) return {};
+      auto Index=Target->getInteger("index");
+      if (Target->getString("slot")!="argument" || !Index || *Index<=0 ||
+          uint64_t(*Index)>Call.getNumArgs() || uint64_t(*Index)>FD->getNumParams() ||
+          !FD->getParamDecl(unsigned(*Index)-1)->getType()->isPointerType()) return {};
+      if (!FD->getReturnType()->isVoidType() && !FD->getReturnType()->isScalarType()) return {};
+      Model.Argument=unsigned(*Index)-1;
+      return Model;
+    }
+    if (Target->getString("slot")!="return" || !FD->getReturnType()->isPointerType()) return {};
+    const auto *Guard=R.getObject("entry"), *Success=R.getObject("success");
+    if (!Guard || !Success) return {};
+    Model.Always=Guard->getBoolean("always").value_or(false);
+    if (!Model.Always) {
+      const auto *Operand=Guard->getObject("operand");
+      auto Value=Guard->getInteger("value");
+      auto Op=Guard->getString("op");
+      auto Index=Operand ? Operand->getInteger("index") : std::nullopt;
+      if (!Operand || Operand->getString("slot")!="argument" || !Index || *Index<=0 ||
+          uint64_t(*Index)>Call.getNumArgs() || uint64_t(*Index)>FD->getNumParams() || !Value ||
+          !Op || (*Op!="eq" && *Op!="ne")) return {};
+      Model.GuardArgument=unsigned(*Index)-1; Model.GuardValue=*Value; Model.Equal=*Op=="eq";
+      auto Type=FD->getParamDecl(Model.GuardArgument)->getType();
+      if (!Type->isIntegerType()) return {};
+      auto Width=Call.getASTContext().getIntWidth(Type);
+      if (Type->isUnsignedIntegerType()) {
+        if (*Value<0 || (Width<64 && (uint64_t(*Value)>>Width))) return {};
+      } else if (Width<64 && !llvm::APInt(64,uint64_t(*Value),true).isSignedIntN(Width)) return {};
+    }
+    Model.MayFail=!Success->getBoolean("always").value_or(false);
+    if (Model.MayFail) {
+      const auto *Operand=Success->getObject("operand");
+      if (!Operand || Operand->getString("slot")!="return" || Success->getString("op")!="ne" ||
+          Success->getInteger("value")!=0) return {};
+    }
+    return Model;
+  }
+};
+
 class MallocChecker
     : public CheckerFamily<
           check::DeadSymbols, check::PointerEscape, check::ConstPointerEscape,
@@ -397,6 +567,10 @@ public:
   /// functions might free the memory.
   /// In optimistic mode, the checker assumes that all user-defined functions
   /// which might free a pointer are annotated.
+  mutable KBMemoryIndex KB;
+  mutable const KBMemoryRecord *ActiveKBFree = nullptr;
+  void addKBFreeNote(BugReport &, CheckerContext &, SourceRange) const;
+  bool evalKBMemory(const CallEvent &, CheckerContext &) const;
   bool ShouldIncludeOwnershipAnnotatedFunctions = false;
 
   bool ShouldRegisterNoOwnershipChangeVisitor = false;
@@ -1245,7 +1419,7 @@ bool MallocChecker::isFreeingCall(const CallEvent &Call) const {
   if (FreeingMemFnMap.lookup(Call) || ReallocatingMemFnMap.lookup(Call))
     return true;
 
-  return isFreeingOwnershipAttrCall(Call);
+  return isFreeingOwnershipAttrCall(Call) || KB.freeing(Call);
 }
 
 bool MallocChecker::isAllocatingOwnershipAttrCall(const CallEvent &Call) {
@@ -1268,6 +1442,7 @@ bool MallocChecker::isMemCall(const CallEvent &Call) const {
       AllocaMemFnMap.lookup(Call) || ReallocatingMemFnMap.lookup(Call))
     return true;
 
+  if (KB.freeing(Call)) return true;
   if (!ShouldIncludeOwnershipAnnotatedFunctions)
     return false;
 
@@ -1712,6 +1887,67 @@ void MallocChecker::checkOwnershipAttr(ProgramStateRef State,
   C.addTransition(State);
 }
 
+bool MallocChecker::evalKBMemory(const CallEvent &Call, CheckerContext &C) const {
+  auto Models = KB.group(Call, true);
+  auto Allocations = KB.group(Call, false);
+  if (!Models.empty() && !Allocations.empty()) {
+    KB.event("degraded",&Models[0],"combined allocation/release requires a reallocation model",&Call);
+    return false;
+  }
+  if (Models.empty()) Models = std::move(Allocations);
+  if (Models.empty() || Models.size()>16) return false;
+  auto State = C.getState();
+  auto Remaining = State;
+  std::vector<std::pair<ProgramStateRef,const KBMemoryRecord *>> Cases;
+  auto &SVB = C.getSValBuilder();
+  for (const auto &Model : Models) {
+    auto Match = Remaining;
+    if (Model.Always) Remaining = nullptr;
+    else {
+      auto Type = cast<FunctionDecl>(Call.getDecl())->getParamDecl(Model.GuardArgument)->getType();
+      llvm::APSInt Integer(llvm::APInt(C.getASTContext().getIntWidth(Type),uint64_t(Model.GuardValue),true),
+                           Type->isUnsignedIntegerType());
+      auto Condition = SVB.evalEQ(Remaining,Call.getArgSVal(Model.GuardArgument),SVB.makeIntVal(Integer)).getAs<DefinedSVal>();
+      if (!Condition) { KB.event("degraded",&Model,"unrepresentable KB allocation guard",&Call); return false; }
+      Match = Remaining->assume(*Condition,Model.Equal);
+      Remaining = Remaining->assume(*Condition,!Model.Equal);
+    }
+    if (Match) Cases.emplace_back(Match,&Model);
+    if (!Remaining) break;
+  }
+  auto Conservative = [&](ProgramStateRef Input, bool Allocation) {
+    Input = Call.invalidateRegions(C.blockCount(),Input);
+    if (Allocation) return MallocBindRetVal(C,Call,Input,false);
+    if (Call.getResultType()->isVoidType()) return Input;
+    auto Return = SVB.conjureSymbolVal(Call.getCFGElementRef(),C.getStackFrame(),Call.getResultType(),C.blockCount());
+    return Input->BindExpr(Call.getOriginExpr(),C.getStackFrame(),Return);
+  };
+  for (const auto &[Input,Model] : Cases) {
+    auto Current = Conservative(Input,!Model->Free);
+    auto Family = AllocationFamily(AF_Custom,Model->Family);
+    if (Model->Free) {
+      bool Known = false;
+      llvm::SaveAndRestore<const KBMemoryRecord *> Active(ActiveKBFree,Model);
+      Current = FreeMemAux(C,Call,Current,Model->Argument,false,Known,Family);
+    } else {
+      auto Return = Current->getSVal(Call.getOriginExpr(),C.getStackFrame()).castAs<DefinedOrUnknownSVal>();
+      auto Success = Current->assume(Return,true);
+      if (Model->MayFail) if (auto Failure = Current->assume(Return,false))
+        C.addTransition(Failure->set<KBMemoryCalls>({Call.getOriginExpr(),C.getStackFrame()},2));
+      Current = MallocMemAux(C,Call,UnknownVal(),UnknownVal(),Success,Family);
+    }
+    if (Current) {
+      Current=Current->set<KBMemoryCalls>({Call.getOriginExpr(),C.getStackFrame()},Model->Free ? 3 : 1);
+      auto Note = ("KB "+Model->File+":"+Twine(Model->Line)+
+          (Model->Free ? " releases " : " allocates ")+Model->Family).str();
+      C.addTransition(Current,C.getNoteTag(Note));
+    }
+    KB.event("applied",Model,Model->Free ? "native memory release" : "native memory allocation",&Call);
+  }
+  if (Remaining) C.addTransition(Conservative(Remaining,false));
+  return true;
+}
+
 bool MallocChecker::evalCall(const CallEvent &Call, CheckerContext &C) const {
   if (!Call.getOriginExpr())
     return false;
@@ -1759,7 +1995,7 @@ bool MallocChecker::evalCall(const CallEvent &Call, CheckerContext &C) const {
     return true;
   }
 
-  return false;
+  return evalKBMemory(Call,C);
 }
 
 // Performs a 0-sized allocations check.
@@ -2668,6 +2904,7 @@ void MallocChecker::HandleNonHeapDealloc(CheckerContext &C, SVal ArgVal,
                                                       os.str(), N);
     R->markInteresting(MR);
     R->addRange(Range);
+    addKBFreeNote(*R,C,Range);
     C.emitReport(std::move(R));
   }
 }
@@ -2691,6 +2928,7 @@ void MallocChecker::HandleFreeAlloca(CheckerContext &C, SVal ArgVal,
         "Memory allocated by 'alloca()' should not be deallocated", N);
     R->markInteresting(ArgVal.getAsRegion());
     R->addRange(Range);
+    addKBFreeNote(*R,C,Range);
     C.emitReport(std::move(R));
   }
 }
@@ -2744,6 +2982,7 @@ void MallocChecker::HandleMismatchedDealloc(CheckerContext &C,
     R->markInteresting(Sym);
     R->addRange(Range);
     R->addVisitor<MallocBugVisitor>(Sym);
+    addKBFreeNote(*R,C,Range);
     C.emitReport(std::move(R));
   }
 }
@@ -2855,6 +3094,7 @@ void MallocChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
     if (PrevSym)
       R->markInteresting(PrevSym);
     R->addVisitor<MallocBugVisitor>(Sym);
+    addKBFreeNote(*R,C,Range);
     C.emitReport(std::move(R));
   }
 }
@@ -3449,6 +3689,7 @@ void MallocChecker::checkPostCall(const CallEvent &Call,
 
 void MallocChecker::checkPreCall(const CallEvent &Call,
                                  CheckerContext &C) const {
+  KB.load(C);
 
   if (const auto *DC = dyn_cast<CXXDeallocatorCall>(&Call)) {
     const CXXDeleteExpr *DE = DC->getOriginExpr();
@@ -4293,3 +4534,27 @@ REGISTER_CHECKER(MismatchedDeallocatorChecker)
 REGISTER_CHECKER(TaintedAllocChecker)
 
 #undef REGISTER_CHECKER
+
+void MallocChecker::addKBFreeNote(BugReport &Report, CheckerContext &C,
+                                 SourceRange Range) const {
+  if (!ActiveKBFree || !Range.getBegin().isValid()) return;
+  auto Note=("KB "+ActiveKBFree->File+":"+Twine(ActiveKBFree->Line)+
+             " models FREE "+ActiveKBFree->Family).str();
+  Report.addNote(Note,PathDiagnosticLocation(Range.getBegin(),C.getSourceManager()));
+}
+// Versioned bridge for a loaded KB checker. The map remains owned by this
+// translation unit; the caller receives a reference-counted state update.
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+void clang_codexek_kb_memory_take_v1(
+    ProgramStateRef *State, const Expr *Call, const StackFrame *Frame,
+    unsigned *Outcome) {
+  KBCallKey Key{Call,Frame};
+  const auto *Marker=(*State)->get<KBMemoryCalls>(Key);
+  *Outcome=Marker ? *Marker : 0;
+  if (Marker) *State=(*State)->remove<KBMemoryCalls>(Key);
+}
