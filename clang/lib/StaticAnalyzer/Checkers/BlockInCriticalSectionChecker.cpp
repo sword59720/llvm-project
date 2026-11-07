@@ -35,6 +35,10 @@
 using namespace clang;
 using namespace ento;
 
+// Defined with the private LockMap trait in PthreadLockChecker.cpp.
+bool codexekHasHeldLock(ProgramStateRef State, SVal WaitMutex);
+bool codexekHasModeledLockPreservation(ProgramStateRef State, const CallEvent &Call);
+
 namespace {
 
 struct CritSectionMarker {
@@ -254,7 +258,8 @@ private:
   using O_NONBLOCKValueTy = std::optional<int>;
   mutable std::optional<O_NONBLOCKValueTy> O_NONBLOCKValue;
 
-  void reportBlockInCritSection(const CallEvent &call, CheckerContext &C) const;
+  void reportBlockInCritSection(const CallEvent &call, CheckerContext &C,
+                                ProgramStateRef State) const;
 
   [[nodiscard]] const NoteTag *createCritSectionNote(CritSectionMarker M,
                                                      CheckerContext &C) const;
@@ -375,10 +380,42 @@ bool BlockInCriticalSectionChecker::isBlockingInCritSection(
 
 void BlockInCriticalSectionChecker::checkPostCall(const CallEvent &Call,
                                                   CheckerContext &C) const {
-  if (isBlockingInCritSection(Call, C)) {
-    reportBlockInCritSection(Call, C);
+  auto State = C.getState();
+  const bool NativeKB = C.getAnalysisManager().getAnalyzerOptions().Config.lookup(
+      "cx.KB:NativeLock") == "true";
+  if (NativeKB && (Call.isGlobalCFunction("pthread_cond_wait") ||
+                   Call.isGlobalCFunction("pthread_cond_timedwait"))) {
+    if (C.wasInlined || codexekHasModeledLockPreservation(State,Call) ||
+        Call.getNumArgs() < 2 || !Call.getArgSVal(1).getAsRegion() ||
+        !codexekHasHeldLock(State, Call.getArgSVal(1))) return;
+    if (const auto Ret = Call.getReturnValue().getAs<DefinedSVal>()) {
+      auto [Failure, Success] = State->assume(*Ret);
+      if (Success) reportBlockInCritSection(Call, C, Success);
+      if (Failure && Call.isGlobalCFunction("pthread_cond_timedwait")) {
+        auto Timeout = tryExpandAsInteger("ETIMEDOUT", C.getBugReporter().getPreprocessor());
+        if (Timeout) {
+          auto Constant = C.getSValBuilder().makeIntVal(*Timeout, C.getASTContext().IntTy);
+          auto IsTimeout = C.getSValBuilder().evalEQ(Failure, *Ret, Constant).getAs<DefinedSVal>();
+          if (IsTimeout) {
+            auto [TimedOut, Other] = Failure->assume(*IsTimeout);
+            if (TimedOut) reportBlockInCritSection(Call, C, TimedOut);
+            Failure = Other;
+          }
+        }
+      }
+      if (Failure) C.addTransition(Failure);
+    }
     return;
   }
+  if (isBlockingInCritSection(Call, C) ||
+      (NativeKB && BlockingFunctions.contains(Call) && codexekHasHeldLock(State, UnknownVal()))) {
+    reportBlockInCritSection(Call, C, State);
+    return;
+  }
+  if (NativeKB && (Call.isGlobalCFunction("pthread_mutex_lock") ||
+                   Call.isGlobalCFunction("pthread_mutex_trylock") ||
+                   Call.isGlobalCFunction("pthread_mutex_unlock")))
+    return;
 
   if (std::optional<MutexDescriptor> LockDesc =
           checkDescriptorMatch(Call, C, /*IsLock=*/true)) {
@@ -414,8 +451,8 @@ bool BlockInCriticalSectionChecker::evalCall(const CallEvent &Call,
 }
 
 void BlockInCriticalSectionChecker::reportBlockInCritSection(
-    const CallEvent &Call, CheckerContext &C) const {
-  ExplodedNode *ErrNode = C.generateNonFatalErrorNode(C.getState());
+    const CallEvent &Call, CheckerContext &C, ProgramStateRef State) const {
+  ExplodedNode *ErrNode = C.generateNonFatalErrorNode(State);
   if (!ErrNode)
     return;
 
