@@ -15,6 +15,7 @@
 //       - `if (<condition>) return <constant-or-&global>;`   (no else),
 //       - `if (<condition>) return V1; else return V2;`,
 //       - `return <constant-or-&global>;`                    (the tail),
+//     or a single `return <pointer param>;` with an unchanged pointer type.
 //     where <condition> is one of
 //       <integer param> == <int literal> | != | !<param> | bare <param>
 //     and every reachable path ends in a return.
@@ -24,31 +25,35 @@
 //   a merge-style "partial extraction" would silently change analyzer
 //   behavior; unsupported entries keep the original analysis).
 //
-// Condition language: <integer param> ==/!= <integer literal>, !<param>,
-// bare <param>. Pointer guards are NOT extracted (the product RET binding
-// requires an integer entry operand). Pointer parameters may appear in
-// return statements only as provable non-null facts (return &global).
+// RET entry predicates require integer parameters. A direct pointer return
+// uses an unconditional RETARG record.
 //
-// Output (path passed via -plugin-arg-cx-kb-extract -out=<path>):
+// Output (path passed via -plugin-arg-cx-kb-extract <path>):
 //   {"schema":1, "file":"<source path>", "entries":[
 //     {"usr","name","signature","linkage","line",
 //      "coverage":"complete"|"unsupported","reason",
 //      "records":[<JSON objects with the encodeRecord field names>]}]}
 
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
+#include "clang/Analysis/CodexekKBInline.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "clang/UnifiedSymbolResolution/USRGeneration.h"
+#include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/JSON.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -110,6 +115,14 @@ const VarDecl *paramRef(const Expr *E, const FunctionDecl &FD) {
   return nullptr;
 }
 
+const VarDecl *integerGuardParam(const Expr *E, const FunctionDecl &FD) {
+  const auto *Param = paramRef(E, FD);
+  if (!Param || !Param->getType()->isIntegerType() ||
+      Param->getType().isVolatileQualified())
+    return nullptr;
+  return Param;
+}
+
 // Recognize <param> ==/!= <literal> (either orientation), !<param>, or bare
 // <param>. Returns false when the shape is outside the record language.
 bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
@@ -122,9 +135,9 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
     }
     const auto *Lit =
         dyn_cast<IntegerLiteral>(BO->getRHS()->IgnoreParenImpCasts());
-    const auto *Ref = paramRef(BO->getLHS(), FD);
+    const auto *Ref = integerGuardParam(BO->getLHS(), FD);
     if (!Ref || !Lit) {
-      Ref = paramRef(BO->getRHS(), FD);
+      Ref = integerGuardParam(BO->getRHS(), FD);
       Lit = dyn_cast<IntegerLiteral>(BO->getLHS()->IgnoreParenImpCasts());
     }
     if (!Ref || !Lit) {
@@ -137,7 +150,18 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
         break;
       }
     C.equal = BO->getOpcode() == BO_EQ;
-    C.value = Lit->getValue().getSExtValue();
+    llvm::APSInt Literal(Lit->getValue(), Lit->getType()->isUnsignedIntegerType());
+    auto Value = Literal.tryExtValue();
+    auto Type = Ref->getType();
+    unsigned Width = FD.getASTContext().getIntWidth(Type);
+    bool Fits = Value && (Type->isUnsignedIntegerType()
+                              ? *Value >= 0 && Literal.isIntN(Width)
+                              : llvm::APInt(64, *Value).isSignedIntN(Width));
+    if (!Fits) {
+      why = "comparison constant outside parameter or KB integer range";
+      return false;
+    }
+    C.value = *Value;
     return true;
   }
   if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
@@ -145,7 +169,7 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
       why = "unrecognized unary condition";
       return false;
     }
-    const auto *Ref = paramRef(UO->getSubExpr(), FD);
+    const auto *Ref = integerGuardParam(UO->getSubExpr(), FD);
     if (!Ref) {
       why = "condition !<expr> with expr not a parameter";
       return false;
@@ -159,7 +183,7 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
     C.value = 0;
     return true;
   }
-  if (const auto *Ref = paramRef(Cond, FD)) {
+  if (const auto *Ref = integerGuardParam(Cond, FD)) {
     for (unsigned i = 0, n = FD.getNumParams(); i < n; ++i)
       if (FD.getParamDecl(i) == Ref) {
         C.param = i + 1;
@@ -173,46 +197,29 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
   return false;
 }
 
-// Return value: integer literal (via casts, optional unary minus),
-// address-of object (non-null fact), or null pointer literal.
-bool recognizeReturnValue(const Expr *E, int64_t &value,
-                          bool &returnsNonNull, std::string &why) {
-  E = E->IgnoreParenImpCasts();
-  if (const auto *Lit = dyn_cast<IntegerLiteral>(E)) {
-    value = Lit->getValue().getSExtValue();
-    returnsNonNull = false;
+// Null and the address of a strong, non-thread-local object with static
+// storage can be represented as pointer nullness facts.
+bool recognizeReturnValue(const Expr *E, ASTContext &Ctx,
+                          bool &ReturnsNonNull) {
+  if (E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull)) {
+    ReturnsNonNull = false;
     return true;
   }
-  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
-    if (UO->getOpcode() == UO_Minus) {
-      if (const auto *Lit = dyn_cast<IntegerLiteral>(
-              UO->getSubExpr()->IgnoreParenImpCasts())) {
-        value = -Lit->getValue().getSExtValue();
-        returnsNonNull = false;
-        return true;
-      }
-    }
-    if (UO->getOpcode() == UO_AddrOf) {
-      // &object => provable non-null; the object's identity is the
-      // caller-side analyzer's responsibility.
-      returnsNonNull = true;
-      value = 0;
-      return true;
-    }
-  }
-  if (isa<CXXNullPtrLiteralExpr>(E)) {
-    value = 0;
-    returnsNonNull = false;
-    return true;
-  }
-  why = "non-constant return value";
-  return false;
+  const auto *Op = dyn_cast<UnaryOperator>(E->IgnoreParenImpCasts());
+  if (!Op || Op->getOpcode() != UO_AddrOf)
+    return false;
+  const auto *Ref = dyn_cast<DeclRefExpr>(Op->getSubExpr()->IgnoreParens());
+  const auto *Object = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+  if (!Object || !Object->hasGlobalStorage() || Object->isWeak() ||
+      Object->getTLSKind() != VarDecl::TLS_None)
+    return false;
+  ReturnsNonNull = true;
+  return true;
 }
 
 struct Exit {
-  bool hasCondition = false;
-  Condition condition;
-  int64_t returnValue = 0;
+  std::optional<Condition> condition;
+  unsigned returnArgument = 0;
   bool returnsNonNull = false;
   unsigned line = 0;
 };
@@ -234,6 +241,28 @@ class BodyWalker {
 public:
   enum class Flow { Terminates, FallsThrough, Unsupported };
 
+  BodyWalker(const FunctionDecl &FD, ASTContext &Ctx, Entry &E)
+      : FD(FD), Ctx(Ctx), E(E) {}
+
+  bool hasFailed() const { return failed; }
+  const std::string &failureReason() const { return why; }
+
+  /* Analyzes the body. Flow::Terminates means every path provably ends in a
+   * recognized constant return (E.exits is the complete contract, with each
+   * exit carrying its accumulated path condition). Flow::FallsThrough means
+   * some path leaves the function without a return — not full coverage. */
+  Flow walkBody(const Stmt *Body) {
+    if (const auto *CS = dyn_cast<CompoundStmt>(Body)) {
+      if (CS->size() == 1)
+        if (const auto *RS = dyn_cast<ReturnStmt>(*CS->body_begin()))
+          if (emitAliasReturn(RS))
+            return Flow::Terminates;
+      return walkSequence(CS);
+    }
+    fail("body is not a statement sequence");
+    return Flow::FallsThrough;
+  }
+
 private:
   const FunctionDecl &FD;
   ASTContext &Ctx;
@@ -248,39 +277,93 @@ private:
     }
   }
 
-public:
-  BodyWalker(const FunctionDecl &FD, ASTContext &Ctx, Entry &E)
-      : FD(FD), Ctx(Ctx), E(E) {}
+  bool emitAliasReturn(const ReturnStmt *RS) {
+    const auto *Value = RS->getRetValue();
+    const auto *Param = Value ? paramRef(Value, FD) : nullptr;
+    if (!Param || Param->getType().isVolatileQualified() ||
+        !Ctx.hasSameType(Param->getType(), FD.getReturnType()))
+      return false;
+    for (unsigned I = 0; I < FD.getNumParams(); ++I)
+      if (FD.getParamDecl(I) == Param) {
+        Exit X;
+        X.returnArgument = I + 1;
+        X.line = Ctx.getSourceManager().getPresumedLoc(RS->getReturnLoc()).getLine();
+        E.exits.push_back(X);
+        return true;
+      }
+    return false;
+  }
 
-  bool hasFailed() const { return failed; }
-  const std::string &failureReason() const { return why; }
+  Flow emitReturn(const ReturnStmt *RS,
+                  std::optional<Condition> condition) {
+    Exit exit;
+    exit.line =
+        Ctx.getSourceManager().getPresumedLoc(RS->getReturnLoc()).getLine();
+    if (!RS->getRetValue()) {
+      fail("void return in pointer-returning function");
+      return Flow::Unsupported;
+    }
+    if (!recognizeReturnValue(RS->getRetValue(), Ctx, exit.returnsNonNull)) {
+      fail("return is neither null nor the address of a static object");
+      return Flow::Unsupported;
+    }
+    exit.condition = condition;
+    E.exits.push_back(exit);
+    return Flow::Terminates;
+  }
 
-  /* Analyzes the body. Flow::Terminates means every path provably ends in a
-   * recognized constant return (E.exits is the complete contract);
-   * Flow::FallsThrough means some path leaves the function without a return
-   * (not full coverage) - combined with failed=false this is still valid
-   * partial content, but v1 requires full coverage, so the caller treats it
-   * as unsupported with the fall-through reason. */
-  Flow walkBody(const Stmt *Body) {
-    if (const auto *CS = dyn_cast<CompoundStmt>(Body))
-      return walkSequence(CS);
-    fail("body is not a statement sequence");
+  Flow walkSequence(const CompoundStmt *CS) {
+    std::optional<Condition> remaining;
+    for (const Stmt *Child : CS->body()) {
+      if (const auto *IS = dyn_cast<IfStmt>(Child)) {
+        // A second guard would need the conjunction with the first guard's
+        // negation. RET records can express only one entry predicate.
+        if (remaining) {
+          fail("multiple guards require a compound entry predicate");
+          return Flow::Unsupported;
+        }
+        if (IS->getInit() || IS->getConditionVariable()) {
+          fail("if with init/condition variable");
+          return Flow::Unsupported;
+        }
+        Condition C;
+        if (!recognizeCondition(IS->getCond(), FD, C, why)) {
+          fail("unextractable condition: " + why);
+          return Flow::Unsupported;
+        }
+        const Stmt *Then = IS->getThen();
+        const ReturnStmt *RS = dyn_cast<ReturnStmt>(Then);
+        if (!RS && isa_and_nonnull<CompoundStmt>(Then)) {
+          const auto *CS2 = cast<CompoundStmt>(Then);
+          if (CS2->size() == 1) RS = dyn_cast<ReturnStmt>(*CS2->body().begin());
+        }
+        if (!RS) {
+          fail("if body is not a single return statement");
+          return Flow::Unsupported;
+        }
+        if (emitReturn(RS, C) == Flow::Unsupported)
+          return Flow::Unsupported;
+
+        C.equal = !C.equal;
+        if (const Stmt *Else = IS->getElse()) {
+          const auto *ER = dyn_cast<ReturnStmt>(Else);
+          if (!ER) {
+            fail("if else body is not a single return statement");
+            return Flow::Unsupported;
+          }
+          return emitReturn(ER, C);
+        }
+        remaining = C;
+        continue;
+      }
+      Flow childFlow = walkStatement(Child, remaining);
+      if (childFlow == Flow::Unsupported) return Flow::Unsupported;
+      if (childFlow == Flow::Terminates) return Flow::Terminates;
+    }
     return Flow::FallsThrough;
   }
 
-private:
-  Flow walkSequence(const CompoundStmt *CS) {
-    Flow flow = Flow::FallsThrough;
-    for (const Stmt *Child : CS->body()) {
-      Flow childFlow = walkStatement(Child);
-      if (childFlow == Flow::Unsupported) return Flow::Unsupported;
-      if (childFlow == Flow::Terminates) return Flow::Terminates;
-      flow = Flow::FallsThrough;
-    }
-    return flow;
-  }
-
-  Flow walkStatement(const Stmt *S) {
+  Flow walkStatement(const Stmt *S, std::optional<Condition> condition) {
     switch (S->getStmtClass()) {
     case Stmt::NullStmtClass:
     case Stmt::DeclStmtClass: {
@@ -294,92 +377,8 @@ private:
             }
       return Flow::FallsThrough; // inert
     }
-    case Stmt::ReturnStmtClass: {
-      const auto *RS = cast<ReturnStmt>(S);
-      Exit exit;
-      exit.line =
-          Ctx.getSourceManager().getPresumedLoc(RS->getReturnLoc()).getLine();
-      if (!RS->getRetValue()) {
-        fail("void return in pointer-returning function");
-        return Flow::Unsupported;
-      }
-      if (!recognizeReturnValue(RS->getRetValue(), exit.returnValue,
-                                exit.returnsNonNull, why)) {
-        fail("unextractable return value: " + why);
-        return Flow::Unsupported;
-      }
-      E.exits.push_back(exit);
-      return Flow::Terminates;
-    }
-    case Stmt::IfStmtClass: {
-      const auto *IS = cast<IfStmt>(S);
-      if (IS->getInit() || IS->getConditionVariable()) {
-        fail("if with init/condition variable");
-        return Flow::Unsupported;
-      }
-      Condition C;
-      if (!recognizeCondition(IS->getCond(), FD, C, why)) {
-        fail("unextractable condition: " + why);
-        return Flow::Unsupported;
-      }
-      // The then-branch must be a single return statement (or a compound
-      // containing exactly one return and nothing else).
-      const Stmt *Then = IS->getThen();
-      const ReturnStmt *RS = dyn_cast<ReturnStmt>(Then);
-      if (!RS && isa_and_nonnull<CompoundStmt>(Then)) {
-        const auto *CS = cast<CompoundStmt>(Then);
-        if (CS->size() == 1) RS = dyn_cast<ReturnStmt>(*CS->body().begin());
-      }
-      if (!RS) {
-        fail("if body is not a single return statement");
-        return Flow::Unsupported;
-      }
-      Exit exit;
-      exit.line =
-          Ctx.getSourceManager().getPresumedLoc(RS->getReturnLoc()).getLine();
-      if (!RS->getRetValue()) {
-        fail("void return in pointer-returning function");
-        return Flow::Unsupported;
-      }
-      if (!recognizeReturnValue(RS->getRetValue(), exit.returnValue,
-                                exit.returnsNonNull, why)) {
-        fail("unextractable return value: " + why);
-        return Flow::Unsupported;
-      }
-      exit.hasCondition = true;
-      exit.condition = C;
-      E.exits.push_back(exit);
-
-      if (!IS->getElse()) return Flow::FallsThrough; // not-taken path continues
-
-      // The else-branch must itself terminate (single return, or another
-      // if-return sequence).
-      const Stmt *Else = IS->getElse();
-      if (const auto *ElseRet = dyn_cast<ReturnStmt>(Else)) {
-        Exit tail;
-        tail.line = Ctx.getSourceManager()
-                        .getPresumedLoc(ElseRet->getReturnLoc())
-                        .getLine();
-        if (!ElseRet->getRetValue()) {
-          fail("void return in pointer-returning function");
-          return Flow::Unsupported;
-        }
-        if (!recognizeReturnValue(ElseRet->getRetValue(), tail.returnValue,
-                                  tail.returnsNonNull, why)) {
-          fail("unextractable return value: " + why);
-          return Flow::Unsupported;
-        }
-        E.exits.push_back(tail);
-        return Flow::Terminates; // both branches terminate
-      }
-      if (const auto *ElseCS = dyn_cast<CompoundStmt>(Else)) {
-        if (walkSequence(ElseCS) == Flow::Terminates) return Flow::Terminates;
-        if (failed) return Flow::Unsupported;
-        return Flow::FallsThrough; // else falls through: not fully covered
-      }
-      if (walkStatement(Else) == Flow::Terminates) return Flow::Terminates;
-      return Flow::FallsThrough;
-    }
+    case Stmt::ReturnStmtClass:
+      return emitReturn(cast<ReturnStmt>(S), condition);
     default: {
       if (const auto *ExprS = dyn_cast<Expr>(S)) {
         const Expr *Stripped = ExprS->IgnoreParenImpCasts();
@@ -413,50 +412,132 @@ std::string generateUSR(const FunctionDecl &FD) {
   return {};
 }
 
+bool supportedCppForwardingFunction(const FunctionDecl &FD) {
+  if (isa<CXXMethodDecl>(FD) || !FD.getIdentifier() ||
+      FD.getTemplatedKind() != FunctionDecl::TK_NonTemplate)
+    return false;
+  const auto *Context = FD.getDeclContext()->getRedeclContext();
+  if (!Context->isFileContext())
+    return false;
+  for (const auto *Declaration : Context->lookup(FD.getDeclName()))
+    if (Declaration->getCanonicalDecl() != FD.getCanonicalDecl())
+      return false;
+  auto isValue = [](QualType T) {
+    return !T.isVolatileQualified() &&
+           (T->isIntegerType() || T->isPointerType());
+  };
+  if (!FD.getReturnType()->isVoidType() && !isValue(FD.getReturnType()))
+    return false;
+  // Even an unused by-value object parameter can run a destructor.
+  return llvm::all_of(FD.parameters(), [&](const ParmVarDecl *P) {
+    return isValue(P->getType());
+  });
+}
+
+// Capture direct forwarding independently of the configured KB. Prepare can
+// recompose the record after a model edit using the cached extraction.
+std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
+                                                ASTContext &Ctx) {
+  if (!FD.isExternallyVisible() || FD.isWeak() || FD.hasAttr<AsmLabelAttr>() ||
+      FD.isNoReturn() || !FD.getType()->isFunctionProtoType() ||
+      (Ctx.getLangOpts().CPlusPlus && !supportedCppForwardingFunction(FD)))
+    return std::nullopt;
+  const auto *Body = dyn_cast<CompoundStmt>(FD.getBody());
+  if (!Body || Body->size() != 1)
+    return std::nullopt;
+  const Stmt *Statement = *Body->body_begin();
+  const Expr *Expression = dyn_cast<Expr>(Statement);
+  if (const auto *Return = dyn_cast<ReturnStmt>(Statement))
+    Expression = Return->getRetValue();
+  else if (!FD.getReturnType()->isVoidType())
+    return std::nullopt;
+  const auto *Call =
+      Expression ? dyn_cast<CallExpr>(Expression->IgnoreParens()) : nullptr;
+  const auto *Callee = Call ? Call->getDirectCallee() : nullptr;
+  if (!Callee || Callee->hasBody() || !Callee->isExternallyVisible() ||
+      Callee->isWeak() || Callee->isVariadic() || Callee->isNoReturn() ||
+      !Callee->getType()->isFunctionProtoType() || Callee->getBuiltinID() ||
+      Callee->hasAttr<AsmLabelAttr>() ||
+      (Ctx.getLangOpts().CPlusPlus && !supportedCppForwardingFunction(*Callee)) ||
+      Call->getNumArgs() != Callee->getNumParams() ||
+      !Ctx.hasSameType(FD.getReturnType(), Callee->getReturnType()))
+    return std::nullopt;
+  auto USR = generateUSR(*Callee);
+  if (USR.empty())
+    return std::nullopt;
+  llvm::SmallDenseSet<const VarDecl *, 8> Used;
+  llvm::json::Array Arguments;
+  for (unsigned I = 0; I < Call->getNumArgs(); ++I) {
+    const auto *Param = paramRef(Call->getArg(I), FD);
+    if (!Param || Param->getType().isVolatileQualified() ||
+        !Ctx.hasSameType(Param->getType(), Callee->getParamDecl(I)->getType()) ||
+        !Used.insert(Param).second)
+      return std::nullopt;
+    const auto *Parm = cast<ParmVarDecl>(Param);
+    Arguments.push_back(static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1);
+  }
+  return llvm::json::Object{{"callee_usr", std::move(USR)},
+                            {"callee", Callee->getQualifiedNameAsString()},
+                            {"signature", canonicalSignature(*Callee, Ctx)},
+                            {"arguments", std::move(Arguments)}};
+}
+
 class KBExtractConsumer : public ASTConsumer {
   std::string OutPath;
   std::string SourcePath;
 
-  void HandleTranslationUnit(ASTContext &Ctx) override {
-    llvm::json::Array Entries;
+  void extractDefinitions(const DeclContext &Context, ASTContext &Ctx,
+                          llvm::json::Array &Entries) {
     auto &SM = Ctx.getSourceManager();
-    for (Decl *D : Ctx.getTranslationUnitDecl()->decls()) {
+    for (Decl *D : Context.decls()) {
+      if (isa<NamespaceDecl, LinkageSpecDecl>(D)) {
+        extractDefinitions(*cast<DeclContext>(D), Ctx, Entries);
+        continue;
+      }
       const auto *FD = dyn_cast<FunctionDecl>(D);
       if (!FD) continue;
-      unsigned line =
-          SM.getPresumedLoc(FD->getLocation()).getLine();
       if (!FD->isThisDeclarationADefinition() || !FD->hasBody()) continue;
+      auto Location = SM.getPresumedLoc(FD->getLocation());
+      Entry E;
+      E.usr = generateUSR(*FD);
+      E.name = FD->getQualifiedNameAsString();
+      E.signature = canonicalSignature(*FD, Ctx);
+      E.line = Location.getLine();
+      E.linkage = FD->isExternallyVisible() ? "external" : "internal";
+      llvm::json::Object JE{{"usr", E.usr}, {"name", E.name},
+                            {"signature", E.signature}, {"linkage", E.linkage},
+                            {"file", Location.isValid() ? Location.getFilename() : SourcePath},
+                            {"line", static_cast<int64_t>(E.line)}};
+      if (!FD->isVariadic())
+        if (auto Forward = forwardingCall(*FD, Ctx)) {
+          JE["coverage"] = "unsupported";
+          JE["reason"] = "forwarded call needs a configured contract";
+          JE["forward"] = std::move(*Forward);
+          Entries.push_back(std::move(JE));
+          continue;
+        }
       if (FD->isVariadic() || isa<CXXMethodDecl>(FD) ||
           FD->getTemplatedKind() != FunctionDecl::TK_NonTemplate ||
           !FD->getReturnType()->isPointerType()) {
-        llvm::json::Object JE;
-        JE["usr"] = generateUSR(*FD);
-        JE["name"] = FD->getNameAsString();
         JE["coverage"] = "unsupported";
         JE["reason"] = FD->getReturnType()->isPointerType()
                            ? "C++ method, template or variadic"
                            : "non-pointer return";
-        JE["line"] = static_cast<int64_t>(line);
         Entries.push_back(std::move(JE));
         continue;
       }
 
-      Entry E;
-      E.usr = generateUSR(*FD);
-      E.name = FD->getNameAsString();
-      E.signature = canonicalSignature(*FD, Ctx);
-      E.line = line;
-      E.linkage = FD->isExternallyVisible() ? "external" : "internal";
+      if (Ctx.getLangOpts().CPlusPlus &&
+          (!Context.isTranslationUnit() || !supportedCppForwardingFunction(*FD))) {
+        JE["coverage"] = "unsupported";
+        JE["reason"] = "C++ declaration outside the supported leaf-function subset";
+        Entries.push_back(std::move(JE));
+        continue;
+      }
 
       BodyWalker Walker(*FD, Ctx, E);
       auto flow = Walker.walkBody(FD->getBody());
 
-      llvm::json::Object JE;
-      JE["usr"] = E.usr;
-      JE["name"] = E.name;
-      JE["signature"] = E.signature;
-      JE["linkage"] = E.linkage;
-      JE["line"] = static_cast<int64_t>(E.line);
       if (Walker.hasFailed() || flow != BodyWalker::Flow::Terminates) {
         JE["coverage"] = "unsupported";
         JE["reason"] = Walker.hasFailed()
@@ -466,30 +547,39 @@ class KBExtractConsumer : public ASTConsumer {
         continue;
       }
       JE["coverage"] = "complete";
+      if (auto Leaf = codexek::exactInlineLeaf(*FD, Ctx))
+        JE["inline_key"] = std::move(Leaf->Key);
       llvm::json::Array Records;
       for (const auto &X : E.exits) {
         llvm::json::Object Rec;
         Rec["schema"] = 1;
         Rec["function"] = E.name;
         Rec["signature"] = E.signature;
-        Rec["unoverloaded"] = true;
-        Rec["kind"] = "RET";
+        Rec["unoverloaded"] = false; /* canonical signature present */
+        Rec["kind"] = X.returnArgument ? "RETARG" : "RET";
         Rec["file"] = SourcePath;
         Rec["line"] = static_cast<int64_t>(X.line);
-        Rec["entry"] = X.hasCondition
-                           ? (X.condition.equal ? predEq(X.condition.param,
-                                                        X.condition.value)
-                                                : predNe(X.condition.param,
-                                                         X.condition.value))
-                           : predAlways();
-        Rec["success"] = X.returnsNonNull ? retSuccessNonNull()
-                                          : retSuccessEq(X.returnValue);
+        Rec["entry"] = predAlways();
+        if (const auto &C = X.condition)
+          Rec["entry"] = C->equal ? predEq(C->param, C->value)
+                                 : predNe(C->param, C->value);
+        if (X.returnArgument) {
+          Rec["target"] = predReturn();
+          Rec["source"] = predOperand(X.returnArgument);
+        } else {
+          Rec["success"] = X.returnsNonNull ? retSuccessNonNull()
+                                            : retSuccessEq(0);
+        }
         Records.push_back(std::move(Rec));
       }
       JE["records"] = std::move(Records);
       Entries.push_back(std::move(JE));
     }
+  }
 
+  void HandleTranslationUnit(ASTContext &Ctx) override {
+    llvm::json::Array Entries;
+    extractDefinitions(*Ctx.getTranslationUnitDecl(), Ctx, Entries);
     llvm::json::Object Root;
     Root["schema"] = 1;
     Root["file"] = SourcePath;

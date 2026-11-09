@@ -15,12 +15,18 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/Analysis/Analyses/LiveVariables.h"
 #include "clang/Analysis/ConstructionContext.h"
+#include "clang/Analysis/CodexekKBInline.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/DynamicExtent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/EntryPointStats.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Base64.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include <optional>
@@ -487,16 +493,39 @@ REGISTER_MAP_WITH_PROGRAMSTATE(DynamicDispatchBifurcationMap,
                                const MemRegion *, unsigned)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CTUDispatchBifurcation, bool)
 
+static std::optional<SVal> getKBInlineReturn(const CallEvent &Call,
+                                             const Decl *Definition,
+                                             StringRef Encoded,
+                                             AnalysisManager &Manager,
+                                             SValBuilder &Builder);
+
 void ExprEngine::ctuBifurcate(const CallEvent &Call, const Decl *D,
                               ExplodedNodeSet &Dst, ExplodedNode *Pred,
                               ProgramStateRef State) {
+  auto InlineNow = [&] {
+    const auto &Config = AMgr.getAnalyzerOptions().Config;
+    if (auto Entry = Config.find("cx.KB:InlineB64");
+        Entry != Config.end() && !Entry->second.empty()) {
+      if (auto Result =
+              getKBInlineReturn(Call, D, Entry->second, AMgr, svalBuilder)) {
+        static SimpleProgramPointTag Tag("ExprEngine", "KB exact leaf");
+        State = State->BindExpr(Call.getOriginExpr(), Pred->getStackFrame(),
+                                *Result);
+        Dst.insert(Engine.makeNode(Call.getProgramPoint(false, &Tag), State,
+                                   Pred));
+        llvm::errs() << "cx-kb-inline: replaced\n";
+        return;
+      }
+    }
+    inlineCall(Engine.getWorkList(), Call, D, Pred, State);
+  };
   if (Call.isForeign() && !isSecondPhaseCTU()) {
     const auto IK = AMgr.options.getCTUPhase1Inlining();
     const bool DoInline = IK == CTUPhase1InliningKind::All ||
                           (IK == CTUPhase1InliningKind::Small &&
                            isSmall(AMgr.getAnalysisDeclContext(D)));
     if (DoInline) {
-      inlineCall(Engine.getWorkList(), Call, D, Pred, State);
+      InlineNow();
       return;
     }
     const bool BState = State->get<CTUDispatchBifurcation>();
@@ -509,7 +538,7 @@ void ExprEngine::ctuBifurcate(const CallEvent &Call, const Decl *D,
     Dst.insert(conservativeEvalCall(Call, Pred, State));
     return;
   }
-  inlineCall(Engine.getWorkList(), Call, D, Pred, State);
+  InlineNow();
 }
 
 void ExprEngine::inlineCall(WorkList *WList, const CallEvent &Call,
@@ -1202,6 +1231,97 @@ static bool isTrivialObjectAssignment(const CallEvent &Call) {
     return false;
 
   return MD->isTrivial();
+}
+
+// The driver supplies a frozen file per CTU configuration. Keep only the
+// last file in this analyzer process and fail closed on invalid input.
+static bool isPreparedKBLeaf(FileManager &Files, StringRef Encoded,
+                             StringRef Key) {
+  struct Cache {
+    std::string Encoded;
+    llvm::StringSet<> Leaves;
+  };
+  static thread_local Cache C;
+  if (C.Encoded != Encoded) {
+    C.Encoded = Encoded.str();
+    C.Leaves.clear();
+    std::string Padded = C.Encoded;
+    while (Padded.size() % 4)
+      Padded += '=';
+    std::vector<char> Path;
+    if (auto Error = llvm::decodeBase64(Padded, Path)) {
+      llvm::consumeError(std::move(Error));
+      return false;
+    }
+    auto Buffer = Files.getBufferForFile(StringRef(Path.data(), Path.size()));
+    if (!Buffer || (*Buffer)->getBufferSize() > 64 * 1024 * 1024)
+      return false;
+    auto Parsed = llvm::json::parse((*Buffer)->getBuffer());
+    if (!Parsed) {
+      llvm::consumeError(Parsed.takeError());
+      return false;
+    }
+    const auto *Root = Parsed->getAsObject();
+    const auto *Leaves = Root && Root->getInteger("schema") == 1
+                             ? Root->getArray("leaves")
+                             : nullptr;
+    if (!Leaves)
+      return false;
+    for (const auto &Entry : *Leaves) {
+      if (auto Leaf = Entry.getAsString(); Leaf && Leaf->size() == 64)
+        C.Leaves.insert(*Leaf);
+      else {
+        C.Leaves.clear();
+        return false;
+      }
+    }
+  }
+  return C.Leaves.contains(Key);
+}
+
+namespace {
+class ExactKBLeafAnalysis : public ManagedAnalysis {
+public:
+  std::optional<codexek::InlineLeaf> Leaf;
+
+  static const void *getTag() {
+    static int Tag;
+    return &Tag;
+  }
+
+  static std::unique_ptr<ExactKBLeafAnalysis> create(AnalysisDeclContext &AC) {
+    auto Result = std::make_unique<ExactKBLeafAnalysis>();
+    if (const auto *FD = dyn_cast<FunctionDecl>(AC.getDecl()))
+      Result->Leaf = codexek::exactInlineLeaf(*FD, FD->getASTContext());
+    return Result;
+  }
+};
+} // namespace
+
+static std::optional<SVal> getKBInlineReturn(const CallEvent &Call,
+                                             const Decl *Definition,
+                                             StringRef Encoded,
+                                             AnalysisManager &Manager,
+                                             SValBuilder &Builder) {
+  const auto *FD = dyn_cast_or_null<FunctionDecl>(Definition);
+  const auto *Declared = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+  if (!FD || !Declared || Declared->hasAttrs() ||
+      !isa_and_nonnull<CallExpr>(Call.getOriginExpr()) ||
+      Call.getNumArgs() != FD->getNumParams() ||
+      !Call.getASTContext().hasSameType(Declared->getType(), FD->getType()) ||
+      !Call.getASTContext().hasSameType(Call.getResultType(), FD->getReturnType()))
+    return std::nullopt;
+  const auto &Leaf = Manager.getAnalysisDeclContext(FD)
+                         ->getAnalysis<ExactKBLeafAnalysis>()->Leaf;
+  auto &Files = Call.getASTContext().getSourceManager().getFileManager();
+  if (!Leaf || !isPreparedKBLeaf(Files, Encoded, Leaf->Key))
+    return std::nullopt;
+  if (!Leaf->Argument)
+    return Builder.makeNullWithType(Call.getResultType());
+  auto Result = Call.getArgSVal(Leaf->Argument - 1);
+  if (Result.isUnknownOrUndef())
+    return std::nullopt;
+  return Result;
 }
 
 void ExprEngine::defaultEvalCall(ExplodedNodeSet &Dst, ExplodedNode *Pred,
