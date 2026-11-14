@@ -44,32 +44,53 @@ endif()
 # Generate LLVMConfig.cmake for the build tree.
 #
 
+# Keep build-tree package paths relative to LLVMConfig.cmake. CMake caches
+# and native build files remain generated artifacts and must be reconfigured
+# after moving a workspace.
+file(RELATIVE_PATH llvm_config_relative_0 "${llvm_cmake_builddir}" "${LLVM_BINARY_DIR}")
+set(llvm_config_path_0 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_0}")
+file(RELATIVE_PATH llvm_config_relative_1 "${llvm_cmake_builddir}" "${LLVM_LIBRARY_DIR}")
+set(llvm_config_path_1 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_1}")
+file(RELATIVE_PATH llvm_config_relative_2 "${llvm_cmake_builddir}" "${LLVM_MAIN_INCLUDE_DIR}")
+set(llvm_config_path_2 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_2}")
+file(RELATIVE_PATH llvm_config_relative_3 "${llvm_cmake_builddir}" "${LLVM_MAIN_SRC_DIR}")
+set(llvm_config_path_3 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_3}")
+file(RELATIVE_PATH llvm_config_relative_4 "${llvm_cmake_builddir}" "${LLVM_INCLUDE_DIR}")
+set(llvm_config_path_4 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_4}")
+file(RELATIVE_PATH llvm_config_relative_5 "${llvm_cmake_builddir}" "${CMAKE_CURRENT_SOURCE_DIR}")
+set(llvm_config_path_5 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_5}")
+file(RELATIVE_PATH llvm_config_relative_6 "${llvm_cmake_builddir}" "${LLVM_TOOLS_BINARY_DIR}")
+set(llvm_config_path_6 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_6}")
+file(RELATIVE_PATH llvm_config_relative_7 "${llvm_cmake_builddir}" "${LLVM_EXPORTS_FILE}")
+set(llvm_config_path_7 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_7}")
+file(RELATIVE_PATH llvm_config_relative_8 "${llvm_cmake_builddir}" "${LLVM_BUILDTREEONLY_EXPORTS_FILE}")
+set(llvm_config_path_8 "\${CMAKE_CURRENT_LIST_DIR}/${llvm_config_relative_8}")
 set(LLVM_CONFIG_CODE "
 # LLVM_BUILD_* values available only from LLVM build tree.
-set(LLVM_BUILD_BINARY_DIR \"${LLVM_BINARY_DIR}\")
-set(LLVM_BUILD_LIBRARY_DIR \"${LLVM_LIBRARY_DIR}\")
-set(LLVM_BUILD_MAIN_INCLUDE_DIR \"${LLVM_MAIN_INCLUDE_DIR}\")
-set(LLVM_BUILD_MAIN_SRC_DIR \"${LLVM_MAIN_SRC_DIR}\")
+set(LLVM_BUILD_BINARY_DIR \"${llvm_config_path_0}\")
+set(LLVM_BUILD_LIBRARY_DIR \"${llvm_config_path_1}\")
+set(LLVM_BUILD_MAIN_INCLUDE_DIR \"${llvm_config_path_2}\")
+set(LLVM_BUILD_MAIN_SRC_DIR \"${llvm_config_path_3}\")
 ")
 
-set(LLVM_CONFIG_MAIN_INCLUDE_DIR "${LLVM_MAIN_INCLUDE_DIR}")
-set(LLVM_CONFIG_INCLUDE_DIR "${LLVM_INCLUDE_DIR}")
+set(LLVM_CONFIG_MAIN_INCLUDE_DIR "${llvm_config_path_2}")
+set(LLVM_CONFIG_INCLUDE_DIR "${llvm_config_path_4}")
 set(LLVM_CONFIG_INCLUDE_DIRS
   "${LLVM_CONFIG_MAIN_INCLUDE_DIR}"
   "${LLVM_CONFIG_INCLUDE_DIR}"
   )
 list(REMOVE_DUPLICATES LLVM_CONFIG_INCLUDE_DIRS)
 
-set(LLVM_CONFIG_LIBRARY_DIR "${LLVM_LIBRARY_DIR}")
+set(LLVM_CONFIG_LIBRARY_DIR "${llvm_config_path_1}")
 set(LLVM_CONFIG_LIBRARY_DIRS
   "${LLVM_CONFIG_LIBRARY_DIR}"
   # FIXME: Should there be other entries here?
   )
 list(REMOVE_DUPLICATES LLVM_CONFIG_LIBRARY_DIRS)
 
-set(LLVM_CONFIG_BINARY_DIR "${LLVM_BINARY_DIR}")
-set(LLVM_CONFIG_CMAKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(LLVM_CONFIG_TOOLS_BINARY_DIR "${LLVM_TOOLS_BINARY_DIR}")
+set(LLVM_CONFIG_BINARY_DIR "${llvm_config_path_0}")
+set(LLVM_CONFIG_CMAKE_DIR "${llvm_config_path_5}")
+set(LLVM_CONFIG_TOOLS_BINARY_DIR "${llvm_config_path_6}")
 
 # Generate a default location for lit
 if (LLVM_BUILD_UTILS)
@@ -92,9 +113,9 @@ endif()
 # tree, both the generated LLVMExports.cmake file and the rest of the cmake
 # source files are put in the same cmake directory.
 set(LLVM_CONFIG_EXPORTS "${LLVM_EXPORTS};${LLVM_EXPORTS_BUILDTREE_ONLY}")
-set(LLVM_CONFIG_INCLUDE_EXPORTS "include(\"${LLVM_EXPORTS_FILE}\")")
+set(LLVM_CONFIG_INCLUDE_EXPORTS "include(\"${llvm_config_path_7}\")")
 set(llvm_config_include_buildtree_only_exports
-"include(\"${LLVM_BUILDTREEONLY_EXPORTS_FILE}\")")
+"include(\"${llvm_config_path_8}\")")
 configure_file(
   LLVMConfig.cmake.in
   ${llvm_cmake_builddir}/LLVMConfig.cmake

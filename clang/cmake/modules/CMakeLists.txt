@@ -28,8 +28,17 @@ if(NOT "clang" IN_LIST LLVM_DEPENDENCY_ONLY_PROJECTS)
 endif()
 
 # Generate ClangConfig.cmake for the build tree.
-set(CLANG_CONFIG_CMAKE_DIR "${clang_cmake_builddir}")
-set(CLANG_CONFIG_LLVM_CMAKE_DIR "${llvm_cmake_builddir}")
+# Resolve build-tree paths relative to the exported config so a workspace can
+# move without retaining the configuring machine's absolute source paths.
+file(RELATIVE_PATH clang_config_llvm_relative
+  "${clang_cmake_builddir}" "${llvm_cmake_builddir}")
+file(RELATIVE_PATH clang_config_source_include_relative
+  "${clang_cmake_builddir}" "${CLANG_SOURCE_DIR}/include")
+file(RELATIVE_PATH clang_config_binary_include_relative
+  "${clang_cmake_builddir}" "${CLANG_BINARY_DIR}/include")
+set(CLANG_CONFIG_CMAKE_DIR "\${CMAKE_CURRENT_LIST_DIR}")
+set(CLANG_CONFIG_LLVM_CMAKE_DIR
+  "\${CMAKE_CURRENT_LIST_DIR}/${clang_config_llvm_relative}")
 if("clang" IN_LIST LLVM_DEPENDENCY_ONLY_PROJECTS)
   # Clang is enabled only to satisfy another project's dependency, so its
   # targets file is not exported above. Leave the include out of the config
@@ -37,11 +46,11 @@ if("clang" IN_LIST LLVM_DEPENDENCY_ONLY_PROJECTS)
   # every find_package(Clang) against this build tree fail.
   set(CLANG_CONFIG_INCLUDE_EXPORTS "")
 else()
-  set(CLANG_CONFIG_INCLUDE_EXPORTS "include(\"${clang_cmake_builddir}/ClangTargets.cmake\")")
+  set(CLANG_CONFIG_INCLUDE_EXPORTS "include(\"\${CMAKE_CURRENT_LIST_DIR}/ClangTargets.cmake\")")
 endif()
 set(CLANG_CONFIG_INCLUDE_DIRS
-  "${CLANG_SOURCE_DIR}/include"
-  "${CLANG_BINARY_DIR}/include"
+  "\${CMAKE_CURRENT_LIST_DIR}/${clang_config_source_include_relative}"
+  "\${CMAKE_CURRENT_LIST_DIR}/${clang_config_binary_include_relative}"
   )
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/ClangConfig.cmake.in
